@@ -1,0 +1,1066 @@
+#!/bin/sh
+set -e
+
+CONFIG=/etc/config/sub-store
+
+[ -r "$CONFIG" ] || {
+    echo "sub-store is not configured." >&2
+    exit 1
+}
+
+IPKG_INSTROOT="${IPKG_INSTROOT:-}"
+. /lib/functions.sh
+. /usr/lib/sub-store/cron.sh
+. /usr/lib/sub-store/registry-image.sh
+config_load sub-store
+config_get FRONTEND_PORT main frontend_port 3001
+config_get BACKEND_PORT main backend_port 3000
+config_get_bool BACKEND_LAN_ACCESS main backend_lan_access 0
+config_get ACCESS_HOST main access_host ""
+config_get PUBLIC_URL main public_url ""
+config_get API_PATH main api_path ""
+config_get SYNC_CRON main sync_cron "55 23 * * *"
+config_get IMAGE_REF main image_ref "xream/sub-store:latest"
+DATA_VOLUME=sub-store-data
+HEALTHCHECK=/usr/lib/sub-store/healthcheck.js
+APP_VERSION_CHECK=/usr/lib/sub-store/app-version.js
+RUN_IMAGE_REF="$IMAGE_REF"
+INSTALL_TRANSACTION_DIR=/etc/sub-store/install-transaction
+
+fail() {
+    echo "sub-storectl: $*" >&2
+    exit 1
+}
+
+assert_sub_store_container() {
+    image="$(docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null || true)"
+    case "$image" in
+        xream/sub-store|xream/sub-store:*|xream/sub-store@sha256:*|\
+        docker.io/xream/sub-store|docker.io/xream/sub-store:*|docker.io/xream/sub-store@sha256:*) ;;
+        *) fail "container $1 is not using the official xream/sub-store image: ${image:-unknown}" ;;
+    esac
+}
+
+assert_official_image_ref() {
+    case "$1" in
+        xream/sub-store@sha256:*|docker.io/xream/sub-store@sha256:*)
+            printf '%s\n' "$1" | grep -Eq '^(docker\.io/)?xream/sub-store@sha256:[0-9a-f]{64}$' ||
+                fail "invalid official image digest: $1"
+            ;;
+        xream/sub-store|xream/sub-store:*|docker.io/xream/sub-store|docker.io/xream/sub-store:*) ;;
+        *) fail "unsupported Docker image reference: $1" ;;
+    esac
+}
+
+valid_config() {
+    case "$FRONTEND_PORT" in
+        ''|*[!0-9]*) fail "frontend port must be an integer" ;;
+    esac
+    [ "$FRONTEND_PORT" -ge 1 ] && [ "$FRONTEND_PORT" -le 65535 ] || fail "frontend port must be between 1 and 65535"
+    case "$BACKEND_PORT" in
+        ''|*[!0-9]*) fail "backend port must be an integer" ;;
+    esac
+    [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ] || fail "backend port must be between 1 and 65535"
+    [ "$FRONTEND_PORT" -ne "$BACKEND_PORT" ] || fail "frontend and backend ports must be different"
+    case "$BACKEND_LAN_ACCESS" in 0|1) ;; *) fail "backend LAN access must be 0 or 1" ;; esac
+    assert_official_image_ref "$IMAGE_REF"
+
+    case "$ACCESS_HOST" in
+        '') ;;
+        *[!A-Za-z0-9.-]*|.*|*.|-*|*-|*..*|*-.*|*.-*)
+            fail "access host must be a hostname or IPv4 address without protocol or port"
+            ;;
+    esac
+
+    if [ -n "$PUBLIC_URL" ]; then
+        printf '%s\n' "$PUBLIC_URL" | grep -Eq '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^?#[:space:]]*)?$' ||
+            fail "public URL must start with http:// or https:// and must not contain a query or fragment"
+        public_authority="${PUBLIC_URL#*://}"
+        public_authority="${public_authority%%/*}"
+        public_host="${public_authority%%:*}"
+        case "$public_host" in
+            *[!A-Za-z0-9.-]*|.*|*.|-*|*-|*..*|*-.*|*.-*)
+                fail "public URL contains an invalid hostname"
+                ;;
+        esac
+        public_port="${public_authority##*:}"
+        if [ "$public_port" != "$public_authority" ]; then
+            [ "$public_port" -ge 1 ] 2>/dev/null && [ "$public_port" -le 65535 ] 2>/dev/null ||
+                fail "public URL port must be between 1 and 65535"
+        fi
+    fi
+
+    [ "${#API_PATH}" -eq 48 ] || fail "API path must contain 48 hexadecimal characters"
+    case "$API_PATH" in
+        *[!0123456789abcdefABCDEF]*) fail "API path must be hexadecimal" ;;
+    esac
+
+    sub_store_valid_cron "$SYNC_CRON" ||
+        fail "sync cron must be a valid five-field expression with minute/hour/day/month/weekday ranges"
+
+}
+
+render_config() {
+    valid_config
+    mkdir -p /etc/sub-store
+}
+
+daemon_ready() {
+    if docker info >/dev/null 2>&1; then
+        return 0
+    fi
+    [ -x /etc/init.d/dockerd ] && /etc/init.d/dockerd start >/dev/null 2>&1 || true
+    n=0
+    while [ "$n" -lt 30 ]; do
+        docker info >/dev/null 2>&1 && return 0
+        n=$((n + 1))
+        sleep 2
+    done
+    fail "Docker daemon did not become ready"
+}
+
+ensure_data_volume() {
+    if ! docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+        docker volume create "$DATA_VOLUME" >/dev/null || fail "could not create Docker volume $DATA_VOLUME"
+    fi
+    VOLUME_PATH="$(docker volume inspect -f '{{.Mountpoint}}' "$DATA_VOLUME" 2>/dev/null || true)"
+    case "$VOLUME_PATH" in
+        /*) ;;
+        *) fail "Docker did not return a valid mountpoint for volume $DATA_VOLUME" ;;
+    esac
+    case "$VOLUME_PATH" in
+        /|*//*|*/../*|*/..|*/./*|*/.) fail "Docker returned an unsafe volume mountpoint: $VOLUME_PATH" ;;
+    esac
+    [ -d "$VOLUME_PATH" ] || fail "Docker volume mountpoint does not exist: $VOLUME_PATH"
+}
+
+volume_is_empty() {
+    volume_entries="$(ls -A "$1" 2>/dev/null)" || return 1
+    [ -z "$volume_entries" ]
+}
+
+copy_directory_to_volume() {
+    source_path="$1"
+    case "$source_path" in
+        /*) ;;
+        *) echo "legacy data source must be an absolute path" >&2; return 1 ;;
+    esac
+    case "$source_path" in
+        /|*//*|*/../*|*/..|*/./*|*/.|*[!A-Za-z0-9._/-]*)
+            echo "legacy data source contains unsupported path segments: $source_path" >&2
+            return 1 ;;
+    esac
+    [ -d "$source_path" ] || { echo "legacy data directory does not exist: $source_path" >&2; return 1; }
+    case "$VOLUME_PATH/" in
+        "$source_path/"*) echo "Docker volume is inside the legacy data directory; refusing recursive copy" >&2; return 1 ;;
+    esac
+    case "$source_path/" in
+        "$VOLUME_PATH/"*) echo "legacy data directory is inside the Docker volume; refusing recursive copy" >&2; return 1 ;;
+    esac
+    volume_is_empty "$VOLUME_PATH" || { echo "Docker volume $DATA_VOLUME is not empty; refusing to overwrite existing data" >&2; return 1; }
+    if ! cp -a "$source_path"/. "$VOLUME_PATH"/; then
+        docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 ||
+            echo "WARNING: Could not remove the partial migration volume $DATA_VOLUME." >&2
+        return 1
+    fi
+}
+
+import_legacy_directory() {
+    daemon_ready
+    ensure_data_volume
+    legacy_path="$1"
+    case "$legacy_path" in
+        /*) ;;
+        *) fail "legacy data source must be an absolute path" ;;
+    esac
+    case "$legacy_path" in
+        /|*//*|*/../*|*/..|*/./*|*/.|*[!A-Za-z0-9._/-]*)
+            fail "legacy data source contains unsupported path segments: $legacy_path"
+            ;;
+    esac
+    if [ -d "$legacy_path" ] && [ -n "$(ls -A "$legacy_path" 2>/dev/null || true)" ]; then
+        copy_directory_to_volume "$legacy_path" || fail "could not import legacy data"
+        echo "Imported legacy data into Docker volume $DATA_VOLUME."
+    else
+        echo "Legacy data directory is empty; Docker volume $DATA_VOLUME is ready."
+    fi
+}
+
+resolve_access_ports() {
+    HOST="$ACCESS_HOST"
+    [ -n "$HOST" ] || HOST="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 127.0.0.1)"
+    LINK_FRONTEND_PORT="$FRONTEND_PORT"
+    LINK_BACKEND_PORT="$BACKEND_PORT"
+    if docker inspect sub-store >/dev/null 2>&1; then
+        mapped_frontend="$(docker port sub-store 3001/tcp 2>/dev/null | awk -F: 'NR == 1 {print $NF}')"
+        mapped_backend="$(docker port sub-store 3000/tcp 2>/dev/null | awk -F: 'NR == 1 {print $NF}')"
+        mapped_merge="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sub-store 2>/dev/null \
+            | sed -n 's/^SUB_STORE_BACKEND_MERGE=//p' | head -n 1)"
+        if [ -n "$mapped_merge" ]; then
+            [ -z "$mapped_backend" ] || mapped_frontend="$mapped_backend"
+            mapped_backend="$mapped_frontend"
+        fi
+        [ -z "$mapped_frontend" ] || LINK_FRONTEND_PORT="$mapped_frontend"
+        [ -z "$mapped_backend" ] || LINK_BACKEND_PORT="$mapped_backend"
+    fi
+}
+
+urlencode() {
+    printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's|/|%2F|g' \
+        -e 's/&/%26/g' -e 's/+/%2B/g' -e 's/=/%3D/g'
+}
+
+show_url() {
+    resolve_access_ports
+    if [ -n "$PUBLIC_URL" ]; then
+        public_base="${PUBLIC_URL%/}"
+        printf '%s/?api=%s\n' "$public_base" "$(urlencode "$public_base/$API_PATH")"
+        return 0
+    fi
+    printf 'http://%s:%s/?api=http%%3A%%2F%%2F%s%%3A%s%%2F%s\n' \
+        "$HOST" "$LINK_FRONTEND_PORT" "$HOST" "$LINK_FRONTEND_PORT" "$API_PATH"
+}
+
+show_api_url() {
+    resolve_access_ports
+    api_host=127.0.0.1
+    [ "$BACKEND_LAN_ACCESS" = "1" ] && api_host="$HOST"
+    printf 'http://%s:%s/%s\n' "$api_host" "$LINK_BACKEND_PORT" "$API_PATH"
+}
+
+show_storage_path() {
+    storage_path=""
+    if docker inspect sub-store >/dev/null 2>&1; then
+        storage_path="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/app/data"}}{{.Source}}{{end}}{{end}}' sub-store 2>/dev/null || true)"
+    fi
+    case "$storage_path" in
+        /*) printf '%s\n' "$storage_path"; return 0 ;;
+    esac
+    storage_path="$(docker volume inspect -f '{{.Mountpoint}}' "$DATA_VOLUME" 2>/dev/null || true)"
+    case "$storage_path" in
+        /*) printf '%s\n' "$storage_path" ;;
+        *) return 1 ;;
+    esac
+}
+
+frontend_cors_origins() {
+    LAN_HOST="$(uci -q get network.lan.ipaddr 2>/dev/null || echo 127.0.0.1)"
+    ORIGINS="http://$LAN_HOST:$FRONTEND_PORT,http://127.0.0.1:$FRONTEND_PORT,http://localhost:$FRONTEND_PORT"
+    if [ -n "$ACCESS_HOST" ] && [ "$ACCESS_HOST" != "$LAN_HOST" ]; then
+        ORIGINS="$ORIGINS,http://$ACCESS_HOST:$FRONTEND_PORT"
+    fi
+    if [ -n "$PUBLIC_URL" ]; then
+        public_origin="$(printf '%s' "$PUBLIC_URL" | sed -n 's|^\(https\?://[^/]*\).*$|\1|p')"
+        [ -z "$public_origin" ] || ORIGINS="$ORIGINS,$public_origin"
+    fi
+    printf '%s' "$ORIGINS"
+}
+
+new_api_path() {
+    dd if=/dev/urandom bs=2048 count=1 2>/dev/null \
+        | LC_ALL=C tr -dc '0123456789abcdef' \
+        | cut -c1-48
+}
+
+update_image() {
+    daemon_ready
+    docker inspect sub-store >/dev/null 2>&1 || {
+        echo '容器尚未创建，请先启动服务。' >&2
+        return 1
+    }
+    assert_sub_store_container sub-store
+    checked_image_id="$(docker inspect -f '{{.Image}}' sub-store)" || return 1
+    printf '%s\n' "$checked_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
+    echo '检查远端镜像版本...'
+    checked_remote="$(remote_image_info "$checked_image_id")" || {
+        echo '镜像版本检查失败，已保留当前容器，未拉取镜像。' >&2
+        return 1
+    }
+    checked_config="${checked_remote%% *}"
+    checked_ref="${checked_remote#* }"
+    if [ "$checked_image_id" = "$checked_config" ]; then
+        running_state="$(docker inspect -f '{{.State.Running}}' sub-store 2>/dev/null)" || return 1
+        [ "$running_state" = "true" ] || {
+            echo 'Current container is stopped; start it before treating the image as up to date.' >&2
+            return 1
+        }
+        echo '镜像已是最新，无需拉取或重建。'
+        return 0
+    fi
+    echo '发现新镜像，开始拉取并更新容器...'
+    replace_container update "$checked_ref" "$checked_config"
+}
+
+install_deploy() {
+    deploy_mode="${1:-restart}"
+    deploy_version="${2:-}"
+    case "$deploy_mode" in
+        update|restart) ;;
+        *) fail "usage: sub-storectl install-deploy {update|restart}" ;;
+    esac
+    case "$deploy_version" in
+        dev) ;;
+        *) printf '%s\n' "$deploy_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+        fail "installer package version is invalid"
+            ;;
+    esac
+
+    HAD_OLD_CONTAINER=0
+    BACKUP_NAME=""
+    INSTALL_DEPLOYMENT=1
+    if [ "$deploy_mode" = "update" ]; then
+        update_image || return 1
+    else
+        replace_container || return 1
+    fi
+
+    deploy_status="$(docker inspect -f '{{.State.Status}}' sub-store 2>/dev/null || true)"
+    if [ "$deploy_status" != "running" ]; then
+        if [ "$HAD_OLD_CONTAINER" = "1" ] && [ -n "$BACKUP_NAME" ] &&
+            docker inspect "$BACKUP_NAME" >/dev/null 2>&1; then
+            rollback_replacement
+        fi
+        fail "installer deployment did not reach running state (status: ${deploy_status:-unknown}); previous container restored when available"
+    fi
+
+    if ! commit_installer_metadata "$deploy_version"; then
+        if [ "$HAD_OLD_CONTAINER" = "1" ] && [ -n "$BACKUP_NAME" ] &&
+            docker inspect "$BACKUP_NAME" >/dev/null 2>&1; then
+            rollback_replacement
+        fi
+        fail "installer metadata could not be committed; previous container restored when available"
+    fi
+
+    if [ "$HAD_OLD_CONTAINER" = "1" ] && [ -n "$BACKUP_NAME" ] &&
+        docker inspect "$BACKUP_NAME" >/dev/null 2>&1; then
+        if ! docker rm "$BACKUP_NAME" >/dev/null 2>&1; then
+            echo "WARNING: Installer deployment is running, but rollback container $BACKUP_NAME could not be removed." >&2
+        elif [ "$deploy_mode" = "update" ]; then
+            cleanup_replaced_image
+        fi
+    fi
+    INSTALL_DEPLOYMENT=0
+}
+
+commit_installer_metadata() {
+    package_version="$1"
+    touch /etc/sub-store/installed &&
+        chmod 600 /etc/sub-store/installed || return 1
+    uci -q delete sub-store.main.data_dir >/dev/null 2>&1 || true
+    uci -q delete sub-store.main.port >/dev/null 2>&1 || true
+    uci commit sub-store && chmod 600 /etc/config/sub-store || return 1
+    printf '%s\n' "$package_version" >/etc/sub-store/version &&
+        chmod 644 /etc/sub-store/version || return 1
+    if [ -d "$INSTALL_TRANSACTION_DIR" ] && [ ! -L "$INSTALL_TRANSACTION_DIR" ]; then
+        printf '%s\n' committed > "$INSTALL_TRANSACTION_DIR/state.tmp.$$" &&
+            chmod 600 "$INSTALL_TRANSACTION_DIR/state.tmp.$$" &&
+            mv -f "$INSTALL_TRANSACTION_DIR/state.tmp.$$" "$INSTALL_TRANSACTION_DIR/state" || return 1
+    fi
+}
+
+record_install_container_backup() {
+    [ -d "$INSTALL_TRANSACTION_DIR" ] && [ ! -L "$INSTALL_TRANSACTION_DIR" ] || return 0
+    [ "$(cat "$INSTALL_TRANSACTION_DIR/state" 2>/dev/null || true)" = prepared ] || return 0
+    printf '%s\n' "$BACKUP_NAME" > "$INSTALL_TRANSACTION_DIR/container-name.tmp.$$"
+    printf '%s\n' "$PREVIOUS_CONTAINER_ID" > "$INSTALL_TRANSACTION_DIR/container-id.tmp.$$"
+    printf '%s\n' "$OLD_WAS_RUNNING" > "$INSTALL_TRANSACTION_DIR/container-was-running.tmp.$$"
+    chmod 600 "$INSTALL_TRANSACTION_DIR"/container-*.tmp.$$ || return 1
+    mv -f "$INSTALL_TRANSACTION_DIR/container-name.tmp.$$" "$INSTALL_TRANSACTION_DIR/container-name" &&
+        mv -f "$INSTALL_TRANSACTION_DIR/container-id.tmp.$$" "$INSTALL_TRANSACTION_DIR/container-id" &&
+        mv -f "$INSTALL_TRANSACTION_DIR/container-was-running.tmp.$$" "$INSTALL_TRANSACTION_DIR/container-was-running"
+}
+
+check_port_conflicts() {
+    conflicts="$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null | awk -F'|' \
+        -v frontend="$FRONTEND_PORT" -v backend="$BACKEND_PORT" '
+        $1 != "sub-store" {
+            ports = $2
+            if (ports ~ (":" frontend "->") || ports ~ (":" backend "->")) print $1 "|" ports
+        }')"
+    [ -z "$conflicts" ] || fail "requested host port is already published by another container: $conflicts"
+    current_frontend=""
+    current_backend=""
+    if docker inspect sub-store >/dev/null 2>&1; then
+        current_frontend="$(docker port sub-store 3001/tcp 2>/dev/null | awk -F: 'NR == 1 {print $NF}')"
+        current_backend="$(docker port sub-store 3000/tcp 2>/dev/null | awk -F: 'NR == 1 {print $NF}')"
+    fi
+    for requested_port in "$FRONTEND_PORT" "$BACKEND_PORT"; do
+        [ "$requested_port" = "$current_frontend" ] && continue
+        [ "$requested_port" = "$current_backend" ] && continue
+        listener_list=""
+        if command -v ss >/dev/null 2>&1; then
+            listener_list="$(ss -lnt 2>/dev/null || true)"
+        elif command -v netstat >/dev/null 2>&1; then
+            listener_list="$(netstat -lnt 2>/dev/null || true)"
+        fi
+        if [ -n "$listener_list" ] && printf '%s\n' "$listener_list" | awk -v port="$requested_port" '
+            NR > 1 { local = $4; sub(/^.*:/, "", local); if (local == port) found = 1 }
+            END { exit found ? 0 : 1 }
+        '; then
+            fail "requested host port $requested_port is already in use by another service"
+        fi
+    done
+}
+
+check_storage_capacity() {
+    available_kb="$(df -Pk "$VOLUME_PATH" 2>/dev/null | awk 'NR == 2 {print $4}')"
+    case "$available_kb" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$available_kb" -lt 131072 ]; then
+        echo "WARNING: Docker storage has less than 128 MiB free: $VOLUME_PATH" >&2
+    fi
+    [ -n "${COPY_SOURCE:-}" ] || return 0
+    [ "$COPY_SOURCE" = "$VOLUME_PATH" ] && return 0
+    source_kb="$(du -sk "$COPY_SOURCE" 2>/dev/null | awk 'NR == 1 {print $1}')"
+    case "$source_kb" in ''|*[!0-9]*) return 0 ;; esac
+    required_kb=$((source_kb + source_kb / 10 + 10240))
+    [ "$available_kb" -ge "$required_kb" ] ||
+        fail "Docker storage does not have enough free space to migrate existing data (need ${required_kb} KiB, available ${available_kb} KiB)"
+}
+
+run_container() {
+    backend_publish="$BACKEND_PORT:3000"
+    [ "$BACKEND_LAN_ACCESS" = "1" ] || backend_publish="127.0.0.1:$BACKEND_PORT:3000"
+    install_transaction_token=""
+    if [ -d "$INSTALL_TRANSACTION_DIR" ] && [ ! -L "$INSTALL_TRANSACTION_DIR" ] &&
+        [ "$(cat "$INSTALL_TRANSACTION_DIR/state" 2>/dev/null || true)" = prepared ] &&
+        [ -f "$INSTALL_TRANSACTION_DIR/new-container-token" ] &&
+        [ ! -L "$INSTALL_TRANSACTION_DIR/new-container-token" ]; then
+        install_transaction_token="$(cat "$INSTALL_TRANSACTION_DIR/new-container-token")"
+        case "$install_transaction_token" in
+            ''|*[!A-Za-z0-9_-]*) fail "installer transaction token is invalid" ;;
+        esac
+    fi
+    CONTAINER_ID="$(docker run -d \
+        --name sub-store \
+        --label "io.sub-store.install-transaction=$install_transaction_token" \
+        --restart unless-stopped \
+        --security-opt no-new-privileges:true \
+        -p "$FRONTEND_PORT:3001" \
+        -p "$backend_publish" \
+        -e TZ=Asia/Shanghai \
+        -e SUB_STORE_FRONTEND_HOST=0.0.0.0 \
+        -e SUB_STORE_FRONTEND_PORT=3001 \
+        -e SUB_STORE_BACKEND_API_HOST=0.0.0.0 \
+        -e SUB_STORE_BACKEND_API_PORT=3000 \
+        -e SUB_STORE_BACKEND_MERGE= \
+        -e "SUB_STORE_FRONTEND_BACKEND_PATH=/$API_PATH" \
+        -e SUB_STORE_BACKEND_PREFIX=true \
+        -e "SUB_STORE_CORS_ALLOWED_ORIGINS=$(frontend_cors_origins)" \
+        -e "SUB_STORE_BACKEND_SYNC_CRON=$SYNC_CRON" \
+        --log-driver json-file \
+        --log-opt max-size=1m \
+        --log-opt max-file=1 \
+        --health-cmd "node -e \"const p=process.env.SUB_STORE_FRONTEND_BACKEND_PATH||'';fetch('http://127.0.0.1:3001'+p+'/api/utils/env').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"" \
+        --health-interval 60s \
+        --health-timeout 10s \
+        --health-retries 3 \
+        --health-start-period 30s \
+        -v "$DATA_VOLUME:/opt/app/data" \
+        "$RUN_IMAGE_REF")" || return 1
+    [ -n "$CONTAINER_ID" ] || return 1
+
+    n=0
+    while [ "$n" -lt 30 ]; do
+        state="$(docker inspect -f '{{.State.Status}}' sub-store 2>/dev/null || true)"
+        if [ "$state" = "running" ]; then
+            docker exec -i sub-store node --input-type=commonjs - < "$HEALTHCHECK" >/dev/null 2>&1 && return 0
+        fi
+        case "$state" in
+            exited|dead) break ;;
+        esac
+        n=$((n + 1))
+        sleep 1
+    done
+
+    echo "sub-store did not stay running after container creation; recent logs:" >&2
+    docker exec -i sub-store node --input-type=commonjs - < "$HEALTHCHECK" >&2 2>/dev/null || true
+    docker logs --tail 80 sub-store >&2 2>/dev/null || true
+    return 1
+}
+
+resolve_official_digest() {
+    docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$1" 2>/dev/null |
+        grep -E '^(docker\.io/)?xream/sub-store@sha256:[0-9a-f]{64}$' | head -n 1
+}
+
+persist_running_image_ref() {
+    resolved_ref="$(resolve_official_digest "$RUN_IMAGE_REF")"
+    [ -n "$resolved_ref" ] || resolved_ref="$RUN_IMAGE_REF"
+    assert_official_image_ref "$resolved_ref"
+    current_ref="$(uci -q get sub-store.main.image_ref 2>/dev/null || true)"
+    if [ "$current_ref" != "$resolved_ref" ]; then
+        if ! uci set "sub-store.main.image_ref=$resolved_ref" || ! uci commit sub-store; then
+            uci -q revert sub-store.main.image_ref >/dev/null 2>&1 || true
+            echo "Could not persist the verified Docker image digest." >&2
+            return 1
+        fi
+        if ! chmod 600 "$CONFIG"; then
+            if [ -n "$current_ref" ]; then
+                uci set "sub-store.main.image_ref=$current_ref" >/dev/null 2>&1 || true
+            else
+                uci -q delete sub-store.main.image_ref >/dev/null 2>&1 || true
+            fi
+            uci commit sub-store >/dev/null 2>&1 || true
+            echo "Could not secure the configuration after saving the Docker image digest." >&2
+            return 1
+        fi
+    fi
+    IMAGE_REF="$resolved_ref"
+    RUN_IMAGE_REF="$resolved_ref"
+}
+
+restore_previous_settings() {
+    changed=0
+    case "$PREVIOUS_FRONTEND_PORT" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$PREVIOUS_FRONTEND_PORT" -ge 1 ] && [ "$PREVIOUS_FRONTEND_PORT" -le 65535 ]; then
+                uci set "sub-store.main.frontend_port=$PREVIOUS_FRONTEND_PORT"
+                FRONTEND_PORT="$PREVIOUS_FRONTEND_PORT"
+                changed=1
+            fi
+            ;;
+    esac
+    case "$PREVIOUS_BACKEND_PORT" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$PREVIOUS_BACKEND_PORT" -ge 1 ] && [ "$PREVIOUS_BACKEND_PORT" -le 65535 ]; then
+                uci set "sub-store.main.backend_port=$PREVIOUS_BACKEND_PORT"
+                BACKEND_PORT="$PREVIOUS_BACKEND_PORT"
+                changed=1
+            fi
+            ;;
+    esac
+    if [ "${#PREVIOUS_API_PATH}" -eq 48 ]; then
+        case "$PREVIOUS_API_PATH" in
+            *[!0123456789abcdefABCDEF]*) ;;
+            *)
+                API_PATH="$(printf '%s' "$PREVIOUS_API_PATH" | tr 'A-F' 'a-f')"
+                uci set "sub-store.main.api_path=$API_PATH"
+                changed=1
+                ;;
+        esac
+    fi
+    if [ -n "$PREVIOUS_SYNC_CRON" ] && sub_store_valid_cron "$PREVIOUS_SYNC_CRON"; then
+        uci set "sub-store.main.sync_cron=$PREVIOUS_SYNC_CRON"
+        SYNC_CRON="$PREVIOUS_SYNC_CRON"
+        changed=1
+    fi
+    if [ "$changed" = "1" ]; then
+        uci commit sub-store
+        chmod 600 "$CONFIG"
+    fi
+}
+
+restore_previous_image_tag() {
+    [ -n "${PREVIOUS_IMAGE_ID:-}" ] || return 0
+    docker image tag "$PREVIOUS_IMAGE_ID" xream/sub-store:latest >/dev/null 2>&1 || {
+        echo "WARNING: The previous image could not be restored as xream/sub-store:latest." >&2
+        return 1
+    }
+}
+
+cleanup_replaced_image() {
+    # Only the image of the container replaced by this update is eligible.
+    printf '%s\n' "${PREVIOUS_IMAGE_ID:-}" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 0
+    cleanup_current_image="$(docker inspect -f '{{.Image}}' sub-store 2>/dev/null)" || {
+        echo "WARNING: Could not verify the current image; old image cleanup was skipped." >&2
+        return 0
+    }
+    printf '%s\n' "$cleanup_current_image" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 0
+    [ "$PREVIOUS_IMAGE_ID" != "$cleanup_current_image" ] || return 0
+
+    cleanup_refs="$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' "$PREVIOUS_IMAGE_ID" 2>/dev/null)" || {
+        echo "WARNING: Could not inspect the old image; cleanup was skipped." >&2
+        return 0
+    }
+    # Preserve images also named by the user or another repository.
+    if printf '%s\n' "$cleanup_refs" | grep -Ev '^(|(docker\.io/)?xream/sub-store(:latest|@sha256:[0-9a-f]{64}))$' >/dev/null; then
+        echo "Old image has other repository references; keeping it."
+        return 0
+    fi
+    cleanup_users="$(docker ps -aq --filter "ancestor=$PREVIOUS_IMAGE_ID" 2>/dev/null)" || {
+        echo "WARNING: Could not check old image usage; cleanup was skipped." >&2
+        return 0
+    }
+    if [ -n "$cleanup_users" ]; then
+        echo "Old image is still used by another container; keeping it."
+        return 0
+    fi
+    # No force, global prune, volume removal, or filesystem deletion.
+    if docker image rm "$PREVIOUS_IMAGE_ID"; then
+        echo "旧镜像已清理，用户数据保留。"
+    else
+        echo "WARNING: Update succeeded, but the old image could not be removed; keeping it." >&2
+    fi
+}
+
+rollback_replacement() {
+    if docker inspect sub-store >/dev/null 2>&1; then
+        docker rm -f sub-store >/dev/null 2>&1 || true
+    fi
+    if [ "$HAD_OLD_CONTAINER" = "1" ] && docker inspect "$BACKUP_NAME" >/dev/null 2>&1; then
+        if [ "$VOLUME_MIGRATION_IN_PROGRESS" = "1" ]; then
+            # This destination was empty before the copy; the original data remains with the old container.
+            docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 ||
+                echo "WARNING: Could not discard the failed migration volume $DATA_VOLUME; the original data is preserved." >&2
+        fi
+        restore_previous_settings || echo "WARNING: Could not restore the prior UCI settings." >&2
+        if docker rename "$BACKUP_NAME" sub-store; then
+            if [ "$OLD_WAS_RUNNING" = "1" ]; then
+                docker start sub-store >/dev/null 2>&1 ||
+                    echo "WARNING: The previous container was restored but did not restart; check docker logs sub-store." >&2
+            fi
+        else
+            echo "WARNING: Could not restore $BACKUP_NAME as sub-store; recover it manually." >&2
+        fi
+    fi
+    restore_previous_image_tag || true
+}
+
+replace_container() {
+    render_config
+    daemon_ready
+    ensure_data_volume
+    RUN_IMAGE_REF="$IMAGE_REF"
+    if [ "${1:-}" = "update" ]; then
+        RUN_IMAGE_REF="${2:-xream/sub-store:latest}"
+        assert_official_image_ref "$RUN_IMAGE_REF"
+    fi
+
+    HAD_OLD_CONTAINER=0
+    OLD_WAS_RUNNING=0
+    BACKUP_NAME=""
+    PREVIOUS_MOUNT_TYPE=""
+    PREVIOUS_MOUNT_NAME=""
+    PREVIOUS_MOUNT_SOURCE=""
+    COPY_SOURCE=""
+    COPY_FROM_CONTAINER=0
+    VOLUME_MIGRATION_IN_PROGRESS=0
+    PREVIOUS_MERGE=""
+    PREVIOUS_API_PATH=""
+    PREVIOUS_FRONTEND_PORT=""
+    PREVIOUS_BACKEND_PORT=""
+    PREVIOUS_SYNC_CRON=""
+    PREVIOUS_IMAGE_ID=""
+    PREVIOUS_CONTAINER_ID=""
+
+    if docker inspect sub-store >/dev/null 2>&1; then
+        HAD_OLD_CONTAINER=1
+        assert_sub_store_container sub-store
+        PREVIOUS_CONTAINER_ID="$(docker inspect -f '{{.Id}}' sub-store 2>/dev/null || true)"
+        PREVIOUS_IMAGE_ID="$(docker inspect -f '{{.Image}}' sub-store 2>/dev/null || true)"
+        PREVIOUS_MOUNT_TYPE="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/app/data"}}{{.Type}}{{end}}{{end}}' sub-store 2>/dev/null || true)"
+        PREVIOUS_MOUNT_NAME="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/app/data"}}{{.Name}}{{end}}{{end}}' sub-store 2>/dev/null || true)"
+        PREVIOUS_MOUNT_SOURCE="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/app/data"}}{{.Source}}{{end}}{{end}}' sub-store 2>/dev/null || true)"
+        PREVIOUS_MOUNT_SOURCE="${PREVIOUS_MOUNT_SOURCE%/}"
+        PREVIOUS_API_PATH="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sub-store \
+            | sed -n 's|^SUB_STORE_FRONTEND_BACKEND_PATH=||p' | head -n 1)"
+        PREVIOUS_API_PATH="${PREVIOUS_API_PATH#/}"
+        PREVIOUS_API_PATH="${PREVIOUS_API_PATH%/}"
+        PREVIOUS_SYNC_CRON="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sub-store \
+            | sed -n 's/^SUB_STORE_BACKEND_SYNC_CRON=//p' | head -n 1)"
+        PREVIOUS_MERGE="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sub-store \
+            | sed -n 's/^SUB_STORE_BACKEND_MERGE=//p' | head -n 1)"
+        if [ -n "$PREVIOUS_MERGE" ]; then
+            # A merged container has no prior pair of distinct host ports.
+            # Keep the requested split settings; show_url reads its live mapping on rollback.
+            PREVIOUS_FRONTEND_PORT=""
+            PREVIOUS_BACKEND_PORT=""
+        else
+            PREVIOUS_FRONTEND_PORT="$(docker port sub-store 3001/tcp 2>/dev/null \
+                | awk -F: 'NR == 1 {print $NF}')"
+            PREVIOUS_BACKEND_PORT="$(docker port sub-store 3000/tcp 2>/dev/null \
+                | awk -F: 'NR == 1 {print $NF}')"
+        fi
+
+        if docker inspect -f '{{.State.Running}}' sub-store 2>/dev/null | grep -qx true; then
+            OLD_WAS_RUNNING=1
+        fi
+
+        case "$PREVIOUS_MOUNT_TYPE" in
+            volume)
+                if [ "$PREVIOUS_MOUNT_NAME" != "$DATA_VOLUME" ]; then
+                    COPY_SOURCE="$(docker volume inspect -f '{{.Mountpoint}}' "$PREVIOUS_MOUNT_NAME" 2>/dev/null || true)"
+                    [ -n "$COPY_SOURCE" ] || {
+                        restore_previous_settings
+                        fail "could not locate the existing Docker volume $PREVIOUS_MOUNT_NAME"
+                    }
+                fi
+                ;;
+            bind)
+                COPY_SOURCE="$PREVIOUS_MOUNT_SOURCE"
+                [ -n "$COPY_SOURCE" ] || {
+                    restore_previous_settings
+                    fail "the existing bind mount has no source path"
+                }
+                ;;
+            '')
+                COPY_FROM_CONTAINER=1
+                ;;
+            *)
+                restore_previous_settings
+                fail "unsupported existing data mount type: $PREVIOUS_MOUNT_TYPE"
+                ;;
+        esac
+
+        if { [ -n "$COPY_SOURCE" ] && [ "$COPY_SOURCE" != "$VOLUME_PATH" ]; } || [ "$COPY_FROM_CONTAINER" = "1" ]; then
+            if ! volume_is_empty "$VOLUME_PATH"; then
+                restore_previous_settings
+                fail "Docker volume $DATA_VOLUME already contains data; refusing to overwrite it during migration"
+            fi
+            if [ -n "$COPY_SOURCE" ] && [ "$COPY_SOURCE" != "$VOLUME_PATH" ]; then
+                case "$COPY_SOURCE" in
+                    /*) ;;
+                    *) restore_previous_settings; fail "existing data mount source is not an absolute path" ;;
+                esac
+                case "$COPY_SOURCE" in
+                    /|*//*|*/../*|*/..|*/./*|*/.|*[!A-Za-z0-9._/-]*)
+                        restore_previous_settings
+                        fail "existing data mount source cannot be safely migrated: $COPY_SOURCE"
+                        ;;
+                esac
+                case "$VOLUME_PATH/" in
+                    "$COPY_SOURCE/"*) restore_previous_settings; fail "Docker volume is nested inside the existing data directory; refusing recursive copy" ;;
+                esac
+                case "$COPY_SOURCE/" in
+                    "$VOLUME_PATH/"*) restore_previous_settings; fail "existing data directory is nested inside the Docker volume; refusing recursive copy" ;;
+                esac
+                [ -d "$COPY_SOURCE" ] || {
+                    restore_previous_settings
+                    fail "existing data mount source does not exist: $COPY_SOURCE"
+                }
+            fi
+        fi
+    fi
+
+    check_port_conflicts
+    check_storage_capacity
+
+    if [ "${1:-}" = "update" ] || ! docker image inspect "$RUN_IMAGE_REF" >/dev/null 2>&1; then
+        pull_ref="$RUN_IMAGE_REF"
+        if ! docker pull "$pull_ref"; then
+            [ "$HAD_OLD_CONTAINER" = "1" ] && restore_previous_settings
+            fail "could not pull the sub-store image; the running container was left unchanged"
+        fi
+    fi
+
+    if [ "${1:-}" = "update" ]; then
+        pulled_image_id="$(docker image inspect -f '{{.Id}}' "$RUN_IMAGE_REF" 2>/dev/null)" || return 1
+        if [ -n "${3:-}" ] && [ "$pulled_image_id" != "$3" ]; then
+            fail "pulled image does not match the checked version; the current container was left unchanged"
+        fi
+        if [ "$HAD_OLD_CONTAINER" = "1" ] && [ "$pulled_image_id" = "$PREVIOUS_IMAGE_ID" ]; then
+            echo "Current container already uses the latest image; no rebuild is required."
+            return 0
+        fi
+    fi
+
+    if [ "$HAD_OLD_CONTAINER" = "1" ]; then
+        BACKUP_NAME="sub-store-rollback-$$"
+        suffix=0
+        while docker inspect "$BACKUP_NAME" >/dev/null 2>&1; do
+            suffix=$((suffix + 1))
+            BACKUP_NAME="sub-store-rollback-$$-$suffix"
+        done
+
+        if [ -d "$INSTALL_TRANSACTION_DIR" ] &&
+            [ "$(cat "$INSTALL_TRANSACTION_DIR/state" 2>/dev/null || true)" = prepared ]; then
+            [ -n "$PREVIOUS_CONTAINER_ID" ] && record_install_container_backup || {
+                restore_previous_settings
+                fail "could not save the installer recovery record; the current container was left unchanged"
+            }
+        fi
+
+        if [ "$OLD_WAS_RUNNING" = "1" ]; then
+            if ! docker stop sub-store >/dev/null; then
+                restore_previous_settings
+                fail "could not stop the existing container; its prior settings were restored"
+            fi
+        fi
+        if ! docker rename sub-store "$BACKUP_NAME"; then
+            if [ "$OLD_WAS_RUNNING" = "1" ]; then
+                docker start sub-store >/dev/null 2>&1 || true
+            fi
+            restore_previous_settings
+            fail "could not move the existing container aside; it was not replaced"
+        fi
+
+        if [ -n "$COPY_SOURCE" ] && [ "$COPY_SOURCE" != "$VOLUME_PATH" ]; then
+            VOLUME_MIGRATION_IN_PROGRESS=1
+            if ! cp -a "$COPY_SOURCE"/. "$VOLUME_PATH"/; then
+                rollback_replacement
+                fail "could not copy existing data into Docker volume $DATA_VOLUME; the previous container was restored"
+            fi
+        elif [ "$COPY_FROM_CONTAINER" = "1" ]; then
+            VOLUME_MIGRATION_IN_PROGRESS=1
+            if ! docker cp "$BACKUP_NAME:/opt/app/data/." "$VOLUME_PATH/"; then
+                rollback_replacement
+                fail "could not copy data from the existing container into Docker volume $DATA_VOLUME; the previous container was restored"
+            fi
+        fi
+    fi
+
+    if run_container; then
+        if [ "$HAD_OLD_CONTAINER" = "0" ] && [ -d "$INSTALL_TRANSACTION_DIR" ] &&
+            [ "$(cat "$INSTALL_TRANSACTION_DIR/state" 2>/dev/null || true)" = prepared ]; then
+            new_container_id="$(docker inspect -f '{{.Id}}' sub-store 2>/dev/null || true)"
+            [ -n "$new_container_id" ] || {
+                rollback_replacement
+                fail "new container started but its installer recovery identity could not be saved"
+            }
+            printf '%s\n' "$new_container_id" > "$INSTALL_TRANSACTION_DIR/new-container-id.tmp.$$"
+            chmod 600 "$INSTALL_TRANSACTION_DIR/new-container-id.tmp.$$" || {
+                rollback_replacement
+                fail "could not secure the new container installer recovery identity"
+            }
+            mv -f "$INSTALL_TRANSACTION_DIR/new-container-id.tmp.$$" "$INSTALL_TRANSACTION_DIR/new-container-id" || {
+                rollback_replacement
+                fail "could not save the new container installer recovery identity"
+            }
+        fi
+        if ! persist_running_image_ref; then
+            rollback_replacement
+            fail "new container was healthy, but its verified image digest could not be saved; the previous container was restored when available"
+        fi
+        if [ "$HAD_OLD_CONTAINER" = "1" ] && [ "${INSTALL_DEPLOYMENT:-0}" != "1" ]; then
+            if ! docker rm "$BACKUP_NAME" >/dev/null 2>&1; then
+                echo "WARNING: New container is running, but the stopped rollback container $BACKUP_NAME could not be removed." >&2
+            elif [ "${1:-}" = "update" ]; then
+                cleanup_replaced_image
+            fi
+        fi
+        return 0
+    fi
+
+    rollback_replacement
+    fail "new container failed to start; the previous container has been restored when available"
+}
+
+clear_runtime_logs() {
+    [ -d /tmp/sub-store-operation/lock ] &&
+        [ "$(cat /tmp/sub-store-operation/action 2>/dev/null || true)" = "clear-runtime-logs" ] ||
+        fail "runtime logs can only be cleared through the queued LuCI action"
+    docker inspect sub-store >/dev/null 2>&1 || fail "Sub-Store container does not exist"
+    assert_sub_store_container sub-store
+    log_driver="$(docker inspect -f '{{.HostConfig.LogConfig.Type}}' sub-store 2>/dev/null || true)"
+    [ "$log_driver" = "json-file" ] || fail "cannot clear runtime logs: the container does not use the json-file logging driver"
+    log_path="$(docker inspect -f '{{.LogPath}}' sub-store 2>/dev/null || true)"
+    [ -n "$log_path" ] && [ -f "$log_path" ] || fail "cannot locate the Sub-Store Docker log file"
+    was_running="$(docker inspect -f '{{.State.Running}}' sub-store 2>/dev/null || true)"
+    case "$was_running" in
+        true) docker stop -t 10 sub-store >/dev/null || fail "could not stop Sub-Store before clearing its logs" ;;
+        false) ;;
+        *) fail "could not determine the Sub-Store container state" ;;
+    esac
+    if ! : > "$log_path"; then
+        [ "$was_running" != "true" ] || docker start sub-store >/dev/null 2>&1 || true
+        fail "could not clear the Sub-Store Docker log file"
+    fi
+    if [ "$was_running" = "true" ] && ! docker start sub-store >/dev/null; then
+        fail "runtime logs were cleared, but Sub-Store did not restart; start the service manually"
+    fi
+    echo "运行日志已清空。"
+}
+
+clear_local_logs() {
+    [ -d /tmp/sub-store-operation/lock ] &&
+        [ "$(cat /tmp/sub-store-operation/action 2>/dev/null || true)" = "clear-maintenance-logs" ] ||
+        fail "maintenance logs can only be cleared through the queued LuCI action"
+    : > /tmp/sub-store-operation/output.log
+}
+
+show_health() {
+    docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' sub-store 2>/dev/null || true
+}
+
+show_app_version() {
+    api_version="$(docker exec -i sub-store node --input-type=commonjs - < "$APP_VERSION_CHECK" 2>/dev/null || true)"
+    if printf '%s\n' "$api_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+        printf '%s\n' "$api_version"
+        return 0
+    fi
+    docker logs --tail 100 sub-store 2>&1 | awk '
+        /Sub-Store -- v?[0-9]+\.[0-9]+\.[0-9]+/ {
+            line = $0
+            sub(/^.*Sub-Store -- /, "", line)
+            sub(/^v/, "", line)
+            sub(/[^0-9.].*$/, "", line)
+            if (line ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) version = line
+        }
+        END { if (version != "") print version }
+    '
+}
+
+export_data() {
+    [ "$#" -eq 1 ] || fail "usage: sub-storectl export-data /absolute/path/sub-store-data.tar.gz"
+    exec /usr/lib/sub-store/export-data "$1"
+}
+
+uninstall_plugin() {
+    delete_data="${1:-}"
+    case "$delete_data" in ''|--keep-data|--delete-data) ;; *) fail "usage: sub-storectl uninstall [--keep-data|--delete-data]" ;; esac
+    daemon_ready
+    [ -x /etc/init.d/sub-store ] && /etc/init.d/sub-store disable >/dev/null 2>&1 || true
+    if docker inspect sub-store >/dev/null 2>&1; then
+        assert_sub_store_container sub-store
+        docker rm -f sub-store >/dev/null
+    fi
+    if [ "$delete_data" = "--delete-data" ]; then
+        if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+            docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || fail "could not remove Docker volume $DATA_VOLUME"
+            echo "Removed Docker volume $DATA_VOLUME."
+        else
+            echo "Docker volume $DATA_VOLUME does not exist."
+        fi
+    else
+        echo "Preserved Docker volume $DATA_VOLUME."
+    fi
+    rm -f /etc/init.d/sub-store /etc/init.d/sub-store-install-recovery \
+        /etc/rc.d/S99sub-store-install-recovery /usr/lib/sub-store/install-recovery \
+        /usr/lib/sub-store/status /usr/lib/sub-store/job.sh \
+        /usr/lib/sub-store/healthcheck.js /usr/lib/sub-store/app-version.js /usr/lib/sub-store/cron.sh /usr/lib/sub-store/permissions.sh \
+        /usr/lib/sub-store/export-data /usr/lib/sub-store/registry-image.sh \
+        /usr/share/rpcd/acl.d/luci-app-sub-store.json /usr/share/luci/menu.d/luci-app-sub-store.json \
+        /www/luci-static/resources/view/sub-store/manage.js /etc/config/sub-store
+    rm -rf /www/luci-static/resources/view/sub-store /etc/sub-store /tmp/sub-store-operation
+    rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
+    rm -rf /tmp/luci-modulecache
+    [ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+    echo "Removed the sub-store LuCI integration and managed container."
+    rm -f /usr/bin/sub-storectl
+}
+
+ACTION="${1:-status}"
+case "$ACTION" in
+    status)
+        if ! docker info >/dev/null 2>&1; then
+            echo "docker-unavailable"
+        elif ! docker inspect sub-store >/dev/null 2>&1; then
+            echo "not-created"
+        else
+            docker inspect -f '{{.State.Status}}' sub-store
+        fi
+        ;;
+    url)
+        show_url
+        ;;
+    api-url)
+        show_api_url
+        ;;
+    storage)
+        show_storage_path || true
+        ;;
+    health)
+        show_health
+        ;;
+    app-version)
+        show_app_version
+        ;;
+    logs)
+        docker logs --tail 100 sub-store
+        ;;
+    clear-runtime-logs)
+        clear_runtime_logs
+        ;;
+    clear-maintenance-logs)
+        clear_local_logs
+        ;;
+    render)
+        render_config
+        ;;
+    import-legacy)
+        [ "$#" -eq 2 ] || fail "usage: sub-storectl import-legacy /absolute/path"
+        import_legacy_directory "$2"
+        ;;
+    start)
+        daemon_ready
+        render_config
+        if docker inspect -f '{{.State.Running}}' sub-store 2>/dev/null | grep -qx true; then
+            echo "sub-store is already running. Use restart to apply changed settings."
+        else
+            replace_container
+        fi
+        ;;
+    stop)
+        if docker inspect sub-store >/dev/null 2>&1; then
+            assert_sub_store_container sub-store
+            docker stop sub-store
+        else
+            echo "sub-store container does not exist."
+        fi
+        ;;
+    restart)
+        replace_container
+        ;;
+    pull)
+        render_config
+        daemon_ready
+        docker pull xream/sub-store:latest
+        ;;
+    update)
+        update_image
+        ;;
+    install-deploy)
+        install_deploy "${2:-restart}" "${3:-}"
+        ;;
+    update-all)
+        image_result=0
+        plugin_result=0
+        echo '检查并更新 Sub-Store Docker 镜像...'
+        if ( "$0" update ); then
+            echo 'Docker 镜像检查完成。'
+        else
+            image_result=$?
+            echo "Docker 镜像更新失败，退出码：$image_result"
+        fi
+        echo '检查并更新 LuCI 插件...'
+        if /usr/lib/sub-store/plugin-update install-if-newer; then
+            echo 'LuCI 插件检查完成。'
+        else
+            plugin_result=$?
+            echo "LuCI 插件更新失败，退出码：$plugin_result"
+        fi
+        if [ "$image_result" -ne 0 ] || [ "$plugin_result" -ne 0 ]; then
+            fail 'One or more update operations failed; see the maintenance log.'
+        fi
+        ;;
+    check-plugin-update)
+        /usr/lib/sub-store/plugin-update check
+        ;;
+    install-plugin-update)
+        /usr/lib/sub-store/plugin-update install
+        ;;
+    rotate-key)
+        NEW_PATH="$(new_api_path)"
+        [ "${#NEW_PATH}" -eq 48 ] || fail "could not generate API path"
+        uci set "sub-store.main.api_path=$NEW_PATH"
+        uci commit sub-store
+        chmod 600 /etc/config/sub-store
+        API_PATH="$NEW_PATH"
+        replace_container
+        show_url
+        ;;
+    remove-container)
+        if docker inspect sub-store >/dev/null 2>&1; then
+            assert_sub_store_container sub-store
+        fi
+        if [ -x /etc/init.d/sub-store ]; then
+            /etc/init.d/sub-store disable
+        fi
+        if docker inspect sub-store >/dev/null 2>&1; then
+            docker rm -f sub-store
+        else
+            echo "sub-store container does not exist."
+        fi
+        ;;
+    export-data)
+        export_data "${2:-}"
+        ;;
+    uninstall)
+        uninstall_plugin "${2:-}"
+        ;;
+    *)
+        fail "usage: sub-storectl {status|health|app-version|url|api-url|storage|logs|check-plugin-update|install-plugin-update|render|import-legacy|start|stop|restart|pull|update|install-deploy|update-all|rotate-key|remove-container|export-data|uninstall}"
+        ;;
+esac

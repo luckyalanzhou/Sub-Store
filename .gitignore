@@ -1,0 +1,13 @@
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+dist/
+/AGENTS.md
+/.tmp-validation/
+*.run
+*.tar.gz
+*.tmp
+__pycache__/
+*.py[cod]
