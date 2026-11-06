@@ -433,6 +433,7 @@ if ! uci -q get sub-store.main.backend_lan_access >/dev/null 2>&1; then
     fi
     uci set "sub-store.main.backend_lan_access=$BACKEND_LAN_DEFAULT"
 fi
+uci -q get sub-store.main.image >/dev/null 2>&1 || uci set sub-store.main.image='xream/sub-store:latest'
 uci -q get sub-store.main.sync_cron >/dev/null 2>&1 || uci set sub-store.main.sync_cron='55 23 * * *'
 uci -q delete sub-store.main.log_max_size_mb >/dev/null 2>&1 || true
 uci -q delete sub-store.main.log_max_files >/dev/null 2>&1 || true
@@ -460,75 +461,23 @@ uci commit sub-store
 chmod 600 /etc/config/sub-store
 /usr/bin/sub-storectl render
 
-step 5 "部署官方镜像、启动容器并检查服务"
-MANAGED_UPGRADE=0
-if [ "$EXISTING" = "1" ] && [ -f /etc/sub-store/installed ]; then
-    MANAGED_UPGRADE=1
-    say "Updating the managed sub-store container..."
-fi
-
-if [ "$EXISTING" != "1" ]; then
-    say "首次安装，联网拉取官方最新镜像..."
-    /usr/bin/sub-storectl pull || fail "Could not pull the official image; installation was stopped before deploying the container."
-    uci set sub-store.main.image_ref='xream/sub-store:latest'
-    uci commit sub-store
-    chmod 600 /etc/config/sub-store
-fi
-
-if [ "$MANAGED_UPGRADE" = "1" ]; then
-    if ! /etc/init.d/sub-store enable || ! /usr/bin/sub-storectl install-deploy update "$PACKAGE_VERSION"; then
-        fail "sub-store update failed; the previous container and installer state were restored when possible."
-    fi
-elif [ "$EXISTING" = "1" ]; then
-    if ! /etc/init.d/sub-store enable || ! /usr/bin/sub-storectl install-deploy restart "$PACKAGE_VERSION"; then
+step 5 "检查现有部署并完成插件安装"
+if [ "$EXISTING" = "1" ]; then
+    if [ -f /etc/sub-store/installed ]; then
+        if ! /etc/init.d/sub-store enable || ! /usr/bin/sub-storectl install-deploy update "$PACKAGE_VERSION"; then
+            fail "sub-store update failed; the previous container and installer state were restored when possible."
+        fi
+    elif ! /etc/init.d/sub-store enable || ! /usr/bin/sub-storectl install-deploy restart "$PACKAGE_VERSION"; then
         fail "Existing sub-store migration failed; the previous container and installer state were restored when possible."
     fi
-elif [ -n "$(uci -q get sub-store.main.data_dir 2>/dev/null || true)" ]; then
-    LEGACY_DATA_DIR="$(uci -q get sub-store.main.data_dir)"
-    say "Importing legacy data into the Docker-managed volume..."
-    /usr/bin/sub-storectl import-legacy "$LEGACY_DATA_DIR"
-    uci -q delete sub-store.main.data_dir >/dev/null 2>&1 || true
-    uci commit sub-store
-    if /etc/init.d/sub-store enable && /etc/init.d/sub-store start; then
-        touch /etc/sub-store/installed
-        chmod 600 /etc/sub-store/installed
-    else
-        fail "sub-store failed to start after importing legacy data."
-    fi
-elif /etc/init.d/sub-store enable && /etc/init.d/sub-store start; then
-    touch /etc/sub-store/installed
-    chmod 600 /etc/sub-store/installed
 else
-    say "New deployment failed."
-    exit 1
-fi
-
-if [ "$EXISTING" = "1" ]; then
-    commit_plugin_update
-    FULL_INSTALL_ACTIVE=0
-fi
-
-if [ "$EXISTING" != "1" ]; then
-    container_status="$(/usr/bin/sub-storectl status 2>/dev/null || true)"
-    [ "$container_status" = "running" ] ||
-        fail "sub-store did not start successfully (container status: ${container_status:-unknown})."
-fi
-
-if [ "$EXISTING" != "1" ]; then
-    uci -q delete sub-store.main.data_dir >/dev/null 2>&1 || true
-    uci -q delete sub-store.main.port >/dev/null 2>&1 || true
-    uci commit sub-store
-    chmod 600 /etc/config/sub-store
+    /etc/init.d/sub-store disable || fail "Could not disable automatic container startup."
     printf '%s\n' "$PACKAGE_VERSION" >/etc/sub-store/version
     chmod 644 /etc/sub-store/version
 fi
 
-# The container, UCI settings, plugin files, and package version now describe
-# the same successful installation.
-if [ "$EXISTING" != "1" ]; then
-    commit_plugin_update
-    FULL_INSTALL_ACTIVE=0
-fi
+commit_plugin_update
+FULL_INSTALL_ACTIVE=0
 INSTALL_OK=1
 
 step 6 "完成安装并输出访问入口"
@@ -543,7 +492,11 @@ say "LuCI 页面已更新；如入口未刷新，请重新登录路由器管理�
 
 say "sub-store package installed."
 say "Container status: $(/usr/bin/sub-storectl status 2>/dev/null || echo unknown)"
-say "Management URL: $(/usr/bin/sub-storectl url)"
-say "Docker storage: $(/usr/bin/sub-storectl storage 2>/dev/null || echo unavailable)"
+if [ "$EXISTING" = "1" ]; then
+    say "Management URL: $(/usr/bin/sub-storectl url)"
+    say "Docker storage: $(/usr/bin/sub-storectl storage 2>/dev/null || echo unavailable)"
+else
+    say "请打开 LuCI 的服务 → sub-store，点击页面底部的安装来部署容器。"
+fi
 say "Package version: $PACKAGE_VERSION"
 say "The first install and image pull require Internet access. No WAN firewall rule or port forward was added."

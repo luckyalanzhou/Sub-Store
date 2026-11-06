@@ -10,7 +10,7 @@ else
 fi
 OPERATION_ID="${3:-}"
 case "$ACTION" in
-    start|stop|restart|update|update-all|rotate-key|check-plugin-update|install-plugin-update|logs|clear-runtime-logs|clear-maintenance-logs) ;;
+    start|stop|restart|install|service-start|service-restart|delete-container|upgrade-apply|update|update-all|rotate-key|check-plugin-update|install-plugin-update|logs|clear-runtime-logs|clear-maintenance-logs) ;;
     *) echo "Unsupported action" >&2; exit 1 ;;
 esac
 if [ "$MODE" = "--enqueue" ] && ! command -v nohup >/dev/null 2>&1; then

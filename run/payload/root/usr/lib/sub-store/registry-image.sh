@@ -26,8 +26,12 @@ remote_image_info() {
         'https://auth.docker.io/token?service=registry.docker.io&scope=repository:xream/sub-store:pull')" || return 1
     registry_token="$(image_json_value "$token_response" '@.token')" || return 1
     case "$registry_token" in ''|*[!A-Za-z0-9._=-]*) return 1 ;; esac
-    remote_manifest="$(registry_manifest latest)" || return 1
-    remote_ref=xream/sub-store:latest
+    selector="${2:-latest}"
+    remote_manifest="$(registry_manifest "$selector")" || return 1
+    case "$selector" in
+        sha256:*) remote_ref="xream/sub-store@$selector" ;;
+        *) remote_ref="xream/sub-store:$selector" ;;
+    esac
     remote_config="$(image_json_value "$remote_manifest" '@.config.digest' || true)"
     if [ -z "$remote_config" ]; then
         # Select this image's platform, ignoring other architectures and attestations.

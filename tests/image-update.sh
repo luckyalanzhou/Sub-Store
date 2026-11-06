@@ -486,7 +486,7 @@ awk '/^step 5 / {copy=1; next} /^step 6 / {exit} copy {print}' "$ROOT/run/payloa
         -e "s|/etc/config/sub-store|$CONFIG|g" \
         -e "s|/etc/sub-store/version|$TEST_DIR/package-version|g" > "$TEST_DIR/install-deployment.sh"
 
-for install_case in fresh cached pull-failed managed managed-failed existing existing-failed; do
+for install_case in fresh managed managed-failed existing existing-failed; do
     rm -f "$TEST_DIR/installer-installed"
     rm -f "$TEST_DIR/package-version" "$TEST_DIR/rollback-removed"
     : > "$TEST_DIR/installer.log"
@@ -539,14 +539,9 @@ for install_case in fresh cached pull-failed managed managed-failed existing exi
         commit_plugin_update() { printf 'commit plugin state\n' >> "$TEST_DIR/installer.log"; }
         . "$TEST_DIR/install-deployment.sh"
     ) > "$TEST_DIR/install-output" 2>&1; then
-        [ "$install_case" != pull-failed ]
+        :
     else
         case "$install_case" in
-            pull-failed)
-                ! grep -q '^init ' "$TEST_DIR/installer.log"
-                ! grep -q '^uci set sub-store.main.image_ref=' "$TEST_DIR/installer.log"
-                continue
-                ;;
             managed|managed-failed|existing-failed)
                 ! grep -q '^commit plugin state$' "$TEST_DIR/installer.log"
                 if [ "$install_case" = managed-failed ]; then
@@ -562,12 +557,10 @@ for install_case in fresh cached pull-failed managed managed-failed existing exi
         esac
     fi
     case "$install_case" in
-        fresh|cached)
-            grep -Fxq 'ctl pull' "$TEST_DIR/installer.log"
-            grep -Fxq 'uci set sub-store.main.image_ref=xream/sub-store:latest' "$TEST_DIR/installer.log"
-            pull_line="$(grep -n '^ctl pull$' "$TEST_DIR/installer.log" | cut -d: -f1)"
-            start_line="$(grep -n '^init start$' "$TEST_DIR/installer.log" | cut -d: -f1)"
-            [ "$pull_line" -lt "$start_line" ]
+        fresh)
+            ! grep -Eq '^ctl |^init (enable|start)$' "$TEST_DIR/installer.log"
+            grep -Fxq 'init disable' "$TEST_DIR/installer.log"
+            grep -Fxq 'commit plugin state' "$TEST_DIR/installer.log"
             ;;
         managed)
             ! grep -q '^ctl pull$' "$TEST_DIR/installer.log"
@@ -586,4 +579,4 @@ for install_case in fresh cached pull-failed managed managed-failed existing exi
     [ "$(cat "$VOLUME_PATH/user-data")" = 'subscription data' ]
 done
 
-echo 'Remote image checks, scoped cleanup, first-install pulls, rollback and data-preservation checks passed.'
+echo 'Remote image checks, scoped cleanup, deferred deployment, rollback and data-preservation checks passed.'

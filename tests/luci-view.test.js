@@ -88,17 +88,17 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.deepEqual(t.view.map.args, ['sub-store', 'sub-store']);
     assert.equal(t.view.map.sections.length, 2);
     assert.deepEqual(t.view.map.sections[0].options.map(option => option.name), [
-        '_service_status', '_service_control'
+        '_service_status'
     ]);
     assert.equal(t.view.map.sections[0].args[3], '服务概览');
     assert.deepEqual(t.view.map.sections[1].tabs.map(tab => tab.name), ['basic', 'logs', 'maintenance']);
     assert.deepEqual(t.view.map.sections[1].options.filter(option => option.tab === 'basic').map(option => option.name), [
         'frontend_port', 'access_host', 'public_url',
         'backend_port', 'backend_lan_access', '_api',
-        'api_path', 'sync_cron'
+        'api_path', 'image', 'sync_cron'
     ]);
-    for (const id of ['_service_status', '_service_control'])
-        assert.equal(t.options[id].tab, undefined);
+    assert.equal(t.options._service_status.tab, undefined);
+    assert.equal(t.options._service_control, undefined);
     assert.equal(t.options._management_ui, undefined);
     assert.equal(t.options._created, undefined);
     assert.deepEqual(t.options._api.dependency, { field: 'backend_lan_access', value: '1' });
@@ -116,14 +116,17 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.equal(t.view.open['aria-label'], '打开Sub-Store管理界面');
     assert.equal(t.view.open.class, 'btn small cbi-button cbi-button-positive');
     const statusControl = t.options._service_status.renderWidget();
-    assert.deepEqual(statusControl.children, [t.view.status, ' ', t.view.open]);
+    assert.equal(statusControl.children[0].children[0], 'sub-store 的状态信息如下：');
+    assert.equal(statusControl.children[1].children[0].children[0].children[0], t.view.statusLabel);
+    assert.equal(statusControl.children[1].children[0].children[1].children[0], t.view.status);
     assert.equal(t.options._management_address, undefined);
     assert.equal(t.view.address, undefined);
     assert.equal(t.view.copyAddressButton, undefined);
-    assert.equal(t.view.status.textContent, 'sub-store 服务已启动');
+    assert.equal(t.view.status.textContent, 'SUB-STORE 运行中');
     assert.equal(t.view.version.textContent, 'test');
     assert.equal(t.view.updateStatus.textContent, '');
-    assert.equal(t.view.status.className, undefined);
+    assert.equal(t.view.status.className, 'btn small cbi-button cbi-button-positive');
+    assert.equal(t.view.statusLabel.textContent, '状态');
     assert.equal(t.view.startButton.disabled, true);
     assert.equal(t.view.stopButton.disabled, false);
     assert.equal(t.view.restartButton.disabled, false);
@@ -202,8 +205,8 @@ test('unhealthy container is visible and completed work refreshes details', asyn
     const t = setup(); await t.view.render(await t.view.load());
     t.state.health = 'unhealthy';
     await t.view.refresh('summary');
-    assert.equal(t.view.status.textContent, 'sub-store 服务运行异常');
-    assert.equal(t.view.status.className, undefined);
+    assert.equal(t.view.status.textContent, 'SUB-STORE 运行异常');
+    assert.equal(t.view.status.className, 'btn small cbi-button cbi-button-negative');
     t.state.busy = true;
     await t.view.refresh('summary');
     t.calls.length = 0;
@@ -358,7 +361,7 @@ test('XHR timeout is quiet when polling confirms the queued task', async () => {
     };
     await t.view.run('update');
     await t.view.enqueueTask;
-    assert.equal(t.view.status.textContent, 'sub-store 服务状态：正在维护');
+    assert.equal(t.view.status.textContent, 'SUB-STORE 正在维护');
     assert.equal(t.calls.some(call => call[0] === 'notice'), false);
     assert.equal(t.view.localBusy, false);
 });
@@ -419,10 +422,34 @@ test('menu and ACL expose only this configuration and fixed helper paths', () =>
     assert.deepEqual(acl.write.uci, ['sub-store']);
     assert.deepEqual(Object.keys(acl.write.file), ['/usr/lib/sub-store/job.sh']);
 });
+test('service buttons follow container state and deletion requires confirmation', async () => {
+    const t = setup(); await t.view.render(await t.view.load());
+    const footer = t.view.addFooter();
+    assert.equal(footer.class, 'cbi-page-actions');
+    const visible = () => footer.children.filter(button => button.tag === 'button' && !button.hidden)
+        .map(button => button.children[0]);
+    assert.deepEqual(visible(), ['升级/应用', '停止', '重启']);
+    t.state.container = 'exited';
+    await t.view.refresh('summary');
+    assert.deepEqual(visible(), ['升级/应用', '启动', '删除']);
+    await t.view.serviceButtons['delete-container'].click();
+    assert.equal(t.calls.at(-1)[0], 'modal');
+    assert.equal(t.calls.some(call => call[0].endsWith('job.sh')), false);
+    const [, , modal] = t.calls.at(-1);
+    await modal[1].children.at(-1).click();
+    await t.view.enqueueTask;
+    assert.deepEqual(visible(), []);
+    Object.assign(t.state, { container: 'not-created', busy: false, phase: 'success' });
+    await t.view.refresh('summary');
+    assert.deepEqual(visible(), ['安装']);
+    assert.match(t.view.status.textContent, /尚未安装/);
+    assert.equal(t.options.image.validate('main', 'xream/sub-store:latest'), true);
+    assert.notEqual(t.options.image.validate('main', 'example/sub-store'), true);
+});
 test('one update button checks the plugin and Docker image, then updates newer versions', async () => {
     const t = setup(); await t.view.render(await t.view.load());
     t.state.version = '0.0.21';
-    assert.equal(t.view.updateButton.children[0], '检查更新');
+    assert.equal(t.view.updateButton.children[0], '升级/应用');
     assert.equal(t.view.updateStatus.textContent, '');
     t.state.plugin_latest_version = '0.0.22';
     t.state.plugin_update_available = true;
@@ -430,11 +457,11 @@ test('one update button checks the plugin and Docker image, then updates newer v
     assert.equal(t.view.updateStatus.textContent, '发现插件 0.0.22');
     await t.view.updateButton.click();
     const queued = t.calls.filter(call => call[0].endsWith('job.sh')).map(call => call[1][1]);
-    assert.deepEqual(queued, ['update-all']);
+    assert.deepEqual(queued, ['upgrade-apply']);
     assert.doesNotMatch(source, /检查插件更新|下载并安装|更新 Sub-Store 镜像/);
     assert.match(source, /重新生成 API 访问密钥/);
     const controller = fs.readFileSync('run/payload/root/usr/bin/sub-storectl', 'utf8');
-    const combinedAction = controller.slice(controller.indexOf('    update-all)'), controller.indexOf('    check-plugin-update)'));
+    const combinedAction = controller.slice(controller.indexOf('    update-all|upgrade-apply)'), controller.indexOf('    check-plugin-update)'));
     assert.match(combinedAction, /\$0" update/);
     assert.match(combinedAction, /plugin-update install-if-newer/);
     assert.match(combinedAction, /image_result.*plugin_result/s);

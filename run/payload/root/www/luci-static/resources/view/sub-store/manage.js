@@ -7,7 +7,15 @@
 'require poll';
 
 const names = { running: '运行中', exited: '已停止', stopped: '已停止', restarting: '正在重启',
-    maintenance: '正在维护', 'docker-unavailable': 'Docker 不可用', 'not-created': '容器尚未创建' };
+    maintenance: '正在维护', 'docker-unavailable': 'Docker 不可用', 'not-created': '尚未安装', created: '已停止' };
+const serviceActions = {
+    'not-created': ['install'],
+    running: ['upgrade-apply', 'stop', 'service-restart'],
+    exited: ['upgrade-apply', 'service-start', 'delete-container'],
+    stopped: ['upgrade-apply', 'service-start', 'delete-container'],
+    created: ['upgrade-apply', 'service-start', 'delete-container']
+};
+const isUpdate = action => action === 'update-all' || action === 'upgrade-apply';
 function validCron(value) {
     const fields = value.trim().split(/\s+/);
     const limits = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
@@ -46,15 +54,19 @@ return view.extend({
     },
     setBusy: function(busy) {
         this.localBusy = busy;
-        const disabled = busy || !!(this.state && this.state.busy);
+        const disabled = busy || !!(this.state && this.state.busy) || !!(this.map && this.map.readonly);
         this.buttons.forEach(button => { button.disabled = disabled; });
         const status = this.state && this.state.container;
-        if (this.startButton)
-            this.startButton.disabled = disabled || !['exited', 'stopped', 'not-created'].includes(status);
-        if (this.stopButton)
-            this.stopButton.disabled = disabled || status !== 'running';
-        if (this.restartButton)
-            this.restartButton.disabled = disabled || status !== 'running';
+        const visible = serviceActions[status] || [];
+        if (this.serviceButtons) {
+            for (const [action, button] of Object.entries(this.serviceButtons)) {
+                button.hidden = !visible.includes(action);
+                button.disabled = disabled || button.hidden;
+            }
+        }
+        if (this.rotateButton) this.rotateButton.hidden = status !== 'running';
+        if (this.clearLogButtons && this.clearLogButtons.container)
+            this.clearLogButtons.container.disabled = disabled || status === 'not-created' || status === 'docker-unavailable';
         if (this.map && this.map.root && this.map.root.querySelectorAll)
             this.map.root.querySelectorAll('input,select,textarea').forEach(input => { input.disabled = disabled; });
     },
@@ -95,8 +107,8 @@ return view.extend({
                 ? s.operation_id !== this.enqueuePreviousOperationId
                 : s.operation && s.operation !== this.enqueuePreviousOperation;
             const taskStarted = pendingAction && s.action === pendingAction && (s.busy || operationChanged);
-            const pluginUpdateInstalled = this.updateAction === 'update-all' &&
-                s.action === 'update-all' && !s.busy && s.phase !== 'running' &&
+            const pluginUpdateInstalled = isUpdate(this.updateAction) &&
+                s.action === this.updateAction && !s.busy && s.phase !== 'running' &&
                 this.updateStartVersion && s.version && s.version !== this.updateStartVersion &&
                 s.plugin_latest_version === s.version &&
                 (s.plugin_update_available === false || s.plugin_update_available === '0');
@@ -108,7 +120,7 @@ return view.extend({
                 if (this.enqueueRequestTimedOut) {
                     this.enqueueStatusMisses = (this.enqueueStatusMisses || 0) + 1;
                     if (this.enqueueStatusMisses < 2) {
-                        if (pendingAction === 'update-all' && this.updateStatus)
+                        if (isUpdate(pendingAction) && this.updateStatus)
                             this.updateStatus.textContent = '正在确认设备状态；状态和日志会自动更新，请勿重复点击。';
                     } else {
                         this.failPendingEnqueue(pendingAction, this.enqueueRequestError);
@@ -139,9 +151,15 @@ return view.extend({
         const s = this.state;
         const unhealthy = s.container === 'running' && s.health === 'unhealthy';
         const starting = s.container === 'running' && s.health === 'starting';
-        this.status.textContent = unhealthy ? 'sub-store 服务运行异常' : starting ? 'sub-store 服务正在启动检查' :
-            s.container === 'running' ? 'sub-store 服务已启动' :
-                'sub-store 服务状态：' + (names[s.container] || s.container || '状态未知');
+        const statusText = unhealthy ? 'SUB-STORE 运行异常' : starting ? 'SUB-STORE 启动中' :
+            s.container === 'running' ? 'SUB-STORE 运行中' :
+                s.container === 'docker-unavailable' ? 'Docker 不可用' :
+                    s.container === 'not-created' ? 'SUB-STORE 尚未安装' :
+                        'SUB-STORE ' + (names[s.container] || s.container || '状态未知');
+        this.status.textContent = statusText;
+        this.status.className = 'btn small cbi-button ' +
+            (s.container === 'running' && !unhealthy ? 'cbi-button-positive' : 'cbi-button-negative');
+        this.statusLabel.textContent = '状态';
         this.version.textContent = s.version || '未知';
         this.open.href = s.url || '#';
         this.open.hidden = !s.url || s.container !== 'running';
@@ -162,15 +180,15 @@ return view.extend({
         const available = s.plugin_update_available === true || s.plugin_update_available === '1';
         if (this.pluginReloadCountdown !== undefined)
             this.updateStatus.textContent = '插件已更新至 ' + this.pluginReloadVersion + ' · ' + this.pluginReloadCountdown + ' 秒后刷新';
-        else if (this.enqueuePendingAction === 'update-all')
+        else if (isUpdate(this.enqueuePendingAction))
             this.updateStatus.textContent = '正在提交…';
-        else if (this.updateAction === 'update-all')
+        else if (isUpdate(this.updateAction))
             this.updateStatus.textContent = '正在检查…';
-        else if (s.action === 'update-all' && s.phase === 'failed')
+        else if (isUpdate(s.action) && s.phase === 'failed')
             this.updateStatus.textContent = '更新失败 · 查看维护日志';
-        else if (s.action === 'update-all' && s.phase === 'success' && latest && comparison === 0)
+        else if (isUpdate(s.action) && s.phase === 'success' && latest && comparison === 0)
             this.updateStatus.textContent = '检查完成 · 插件 ' + latest;
-        else if (s.action === 'update-all' && s.phase === 'success')
+        else if (isUpdate(s.action) && s.phase === 'success')
             this.updateStatus.textContent = '检查完成';
         else if (latest && comparison === 0)
             this.updateStatus.textContent = '插件 ' + latest;
@@ -206,7 +224,7 @@ return view.extend({
         if (!this.logBoxes || !this.state) return;
         const logs = {
             operation: this.state.output,
-            container: this.state.container_log
+            container: this.state.container === 'not-created' ? '' : this.state.container_log
         };
         Object.keys(logs).forEach(name => {
             const box = this.logBoxes[name];
@@ -236,11 +254,12 @@ return view.extend({
     },
     run: async function(action) {
         if (this.localBusy || (this.state && this.state.busy)) throw new Error('已有操作正在执行，请等待完成。');
-        if (action === 'update-all') {
+        if (isUpdate(action)) {
             this.updateAction = action;
             this.updateStartVersion = this.state && this.state.version;
-            this.showMaintenanceLogs();
         }
+        if (isUpdate(action) || Object.values(serviceActions).some(actions => actions.includes(action)))
+            this.showMaintenanceLogs();
         this.enqueuePendingAction = action;
         this.enqueuePreviousOperation = (this.state && this.state.operation) || '';
         this.enqueuePreviousOperationId = (this.state && this.state.operation_id) || '';
@@ -260,7 +279,7 @@ return view.extend({
                 const refreshed = await this.refresh('summary');
                 if (this.enqueuePendingAction === action && !refreshed) {
                     if (this.enqueueRequestTimedOut) {
-                        if (action === 'update-all' && this.updateStatus)
+                        if (isUpdate(action) && this.updateStatus)
                             this.updateStatus.textContent = '正在确认设备状态；状态和日志会自动更新，请勿重复点击。';
                     } else {
                         this.failPendingEnqueue(action, result.error);
@@ -278,7 +297,7 @@ return view.extend({
                     if (this.enqueuePendingAction === action && !refreshed && !this.enqueueRequestTimedOut)
                         this.failPendingEnqueue(action, error);
                     if (this.enqueuePendingAction === action && !refreshed && this.enqueueRequestTimedOut &&
-                        action === 'update-all' && this.updateStatus)
+                        isUpdate(action) && this.updateStatus)
                         this.updateStatus.textContent = '正在确认设备状态；状态和日志会自动更新，请勿重复点击。';
                 });
             }
@@ -304,7 +323,13 @@ return view.extend({
     },
     button: function(label, action, style) {
         const button = E('button', { type: 'button', 'class': 'cbi-button cbi-button-' + (style || 'action'),
-            click: ui.createHandlerFn(this, function() { return this.run(action); }) }, [label]);
+            click: ui.createHandlerFn(this, function() {
+                if (action === 'delete-container')
+                    return this.confirm(action, '删除容器', '将删除已停止的容器及可确认归属且未被其他容器使用的镜像。配置和数据卷会保留。');
+                if (action === 'install' || action === 'upgrade-apply')
+                    return this.applySettings(action);
+                return this.run(action);
+            }) }, [label]);
         this.buttons.push(button);
         return button;
     },
@@ -317,32 +342,50 @@ return view.extend({
         } finally { this.setBusy(false); }
     },
     handleSaveApply: async function() {
+        return this.applySettings(this.state.container === 'not-created' ? null : 'restart');
+    },
+    applySettings: async function(action) {
         if (this.localBusy || this.state.busy) throw new Error('请等待维护操作完成后再保存。');
         this.setBusy(true);
         try {
             await this.map.save(null, true);
             await ui.changes.apply();
         } finally { this.setBusy(false); }
+        if (!action) return;
         this.reloadAfterTask = true;
         this.reloadTaskAccepted = false;
         try {
-            await this.run('restart');
+            await this.run(action);
             await this.enqueueTask;
         }
         catch (error) { this.reloadAfterTask = false; throw error; }
     },
     handleReset: function() { return this.map.reset(); },
+    addFooter: function() {
+        return E('div', { 'class': 'cbi-page-actions' },
+            Object.values(this.serviceButtons).flatMap(button => [' ', button]));
+    },
     render: async function(data) {
         this.state = data[1];
         this.buttons = [];
         this.status = E('span');
+        this.statusLabel = E('span');
         this.version = E('span');
         this.open = E('a', { 'class': 'btn small cbi-button cbi-button-positive', target: '_blank', rel: 'noopener noreferrer' }, ['打开']);
         this.open.textContent = '打开Sub-Store';
         this.open.setAttribute('aria-label', '打开Sub-Store管理界面');
-        this.startButton = this.button('启动', 'start');
+        this.startButton = this.button('启动', 'service-start');
         this.stopButton = this.button('停止', 'stop', 'negative');
-        this.restartButton = this.button('重启', 'restart');
+        this.restartButton = this.button('重启', 'service-restart');
+        this.updateButton = this.button('升级/应用', 'upgrade-apply', 'positive');
+        this.serviceButtons = {
+            install: this.button('安装', 'install', 'positive'),
+            'upgrade-apply': this.updateButton,
+            stop: this.stopButton,
+            'service-restart': this.restartButton,
+            'service-start': this.startButton,
+            'delete-container': this.button('删除', 'delete-container', 'negative')
+        };
         const m = this.map = new form.Map('sub-store', 'sub-store');
         const overview = m.section(form.NamedSection, 'main', 'settings', '服务概览');
         const s = m.section(form.NamedSection, 'main', 'settings');
@@ -359,9 +402,14 @@ return view.extend({
             option.renderWidget = function() { return node; };
             return option;
         };
-        displayOverview('_service_status', '服务状态', E('div', {}, [this.status, ' ', this.open]));
-        displayOverview('_service_control', '服务控制', E('div', {}, [
-            this.startButton, ' ', this.stopButton, ' ', this.restartButton
+        displayOverview('_service_status', '服务状态', E('div', {}, [
+            E('p', {}, ['sub-store 的状态信息如下：']),
+            E('div', { 'class': 'table' }, [
+                E('div', { 'class': 'tr' }, [
+                    E('div', { 'class': 'td' }, [this.statusLabel]),
+                    E('div', { 'class': 'td' }, [this.status, ' ', this.open])
+                ])
+            ])
         ]));
         let o = s.taboption('basic', form.Value, 'frontend_port', '管理页面端口');
         o.datatype = 'port'; o.rmempty = false; o.default = '3001';
@@ -393,13 +441,18 @@ return view.extend({
         o = s.taboption('basic', form.Value, 'api_path', 'API 密钥');
         o.password = true; o.rmempty = false;
         o.validate = function(section, value) { return /^[a-fA-F0-9]{48}$/.test(value) || '请输入 48 位十六进制字符。'; };
+        o = s.taboption('basic', form.Value, 'image', '镜像');
+        o.default = 'xream/sub-store:latest'; o.rmempty = false;
+        o.validate = function(section, value) {
+            return /^(docker\.io\/)?xream\/sub-store(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[a-f0-9]{64})?$/.test(value) ||
+                '请输入官方 xream/sub-store 镜像引用。';
+        };
         o = s.taboption('basic', form.Value, 'sync_cron', 'Cron 表达式');
         o.default = '55 23 * * *'; o.rmempty = false;
         o.validate = function(section, value) { return validCron(value) || 'Cron 格式或字段范围不正确。'; };
         this.image = E('span');
         this.appVersion = E('span');
         this.updateStatus = E('span', { 'aria-live': 'polite' });
-        this.updateButton = this.button('检查更新', 'update-all', 'positive');
         this.followLogs = { container: true, operation: true };
         this.logBoxes = {};
         this.clearLogButtons = {};
@@ -436,11 +489,12 @@ return view.extend({
                 return this.confirm('rotate-key', '重新生成 API 访问密钥', '成功后旧管理地址会立即失效。未保存的表单修改将丢弃，请先保存需要保留的设置。');
             }) }, ['重新生成']);
         this.buttons.push(rotate);
+        this.rotateButton = rotate;
         display('maintenance', '_plugin_version', '插件版本', this.version);
         display('maintenance', '_app_version', 'Sub-Store 版本', this.appVersion);
         display('maintenance', '_image', 'Docker 镜像', this.image);
         display('maintenance', '_updates', '更新', E('div', {}, [
-            this.updateButton, ' ', E('span', { 'aria-live': 'polite' }, [this.updateStatus])
+            this.updateStatus
         ]));
         display('maintenance', '_rotate', 'API 密钥', rotate);
         const formNode = await m.render();

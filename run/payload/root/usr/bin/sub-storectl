@@ -21,6 +21,7 @@ config_get PUBLIC_URL main public_url ""
 config_get API_PATH main api_path ""
 config_get SYNC_CRON main sync_cron "55 23 * * *"
 config_get IMAGE_REF main image_ref "xream/sub-store:latest"
+config_get CONFIGURED_IMAGE main image "xream/sub-store:latest"
 DATA_VOLUME=sub-store-data
 HEALTHCHECK=/usr/lib/sub-store/healthcheck.js
 APP_VERSION_CHECK=/usr/lib/sub-store/app-version.js
@@ -42,12 +43,17 @@ assert_sub_store_container() {
 }
 
 assert_official_image_ref() {
+    case "$1" in *[!A-Za-z0-9._/:@-]*) fail "invalid Docker image reference" ;; esac
     case "$1" in
         xream/sub-store@sha256:*|docker.io/xream/sub-store@sha256:*)
             printf '%s\n' "$1" | grep -Eq '^(docker\.io/)?xream/sub-store@sha256:[0-9a-f]{64}$' ||
                 fail "invalid official image digest: $1"
             ;;
-        xream/sub-store|xream/sub-store:*|docker.io/xream/sub-store|docker.io/xream/sub-store:*) ;;
+        xream/sub-store|docker.io/xream/sub-store) ;;
+        xream/sub-store:*|docker.io/xream/sub-store:*)
+            printf '%s\n' "${1##*:}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$' ||
+                fail "invalid official image tag"
+            ;;
         *) fail "unsupported Docker image reference: $1" ;;
     esac
 }
@@ -64,6 +70,7 @@ valid_config() {
     [ "$FRONTEND_PORT" -ne "$BACKEND_PORT" ] || fail "frontend and backend ports must be different"
     case "$BACKEND_LAN_ACCESS" in 0|1) ;; *) fail "backend LAN access must be 0 or 1" ;; esac
     assert_official_image_ref "$IMAGE_REF"
+    assert_official_image_ref "${CONFIGURED_IMAGE-xream/sub-store:latest}"
 
     case "$ACCESS_HOST" in
         '') ;;
@@ -262,7 +269,13 @@ new_api_path() {
         | cut -c1-48
 }
 
+deployment_config_hash() {
+    printf '%s\n' "$FRONTEND_PORT" "$BACKEND_PORT" "$BACKEND_LAN_ACCESS" \
+        "$API_PATH" "$SYNC_CRON" "$(frontend_cors_origins)" | sha256sum | cut -d ' ' -f 1
+}
+
 update_image() {
+    valid_config
     daemon_ready
     docker inspect sub-store >/dev/null 2>&1 || {
         echo '容器尚未创建，请先启动服务。' >&2
@@ -272,12 +285,36 @@ update_image() {
     checked_image_id="$(docker inspect -f '{{.Image}}' sub-store)" || return 1
     printf '%s\n' "$checked_image_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 1
     echo '检查远端镜像版本...'
-    checked_remote="$(remote_image_info "$checked_image_id")" || {
+    image_selector=latest
+    configured_image="${CONFIGURED_IMAGE:-xream/sub-store:latest}"
+    case "$configured_image" in
+        *@*) image_selector="${configured_image##*@}" ;;
+        *:*) image_selector="${configured_image##*:}" ;;
+    esac
+    checked_remote="$(remote_image_info "$checked_image_id" "$image_selector")" || {
         echo '镜像版本检查失败，已保留当前容器，未拉取镜像。' >&2
         return 1
     }
     checked_config="${checked_remote%% *}"
     checked_ref="${checked_remote#* }"
+    if [ "${1:-}" = apply ]; then
+        current_state="$(docker inspect -f '{{.State.Status}}' sub-store)" || return 1
+        case "$current_state" in
+            running) ;;
+            exited|created) KEEP_STOPPED=1 ;;
+            *) fail "container cannot be upgraded in state $current_state" ;;
+        esac
+        if [ "$checked_image_id" = "$checked_config" ]; then
+            current_hash="$(docker inspect -f '{{index .Config.Labels "io.sub-store.config-hash"}}' sub-store)" || return 1
+            if [ "$current_hash" != "$(deployment_config_hash)" ]; then
+                current_ref="$(docker inspect -f '{{.Config.Image}}' sub-store)" || return 1
+                replace_container apply "$current_ref" "$checked_image_id"
+            else
+                echo '镜像和配置未变化。'
+            fi
+            return $?
+        fi
+    fi
     if [ "$checked_image_id" = "$checked_config" ]; then
         running_state="$(docker inspect -f '{{.State.Running}}' sub-store 2>/dev/null)" || return 1
         [ "$running_state" = "true" ] || {
@@ -433,6 +470,7 @@ run_container() {
     CONTAINER_ID="$(docker run -d \
         --name sub-store \
         --label "io.sub-store.install-transaction=$install_transaction_token" \
+        --label "io.sub-store.config-hash=$(deployment_config_hash)" \
         --restart unless-stopped \
         --security-opt no-new-privileges:true \
         -p "$FRONTEND_PORT:3001" \
@@ -569,17 +607,27 @@ cleanup_replaced_image() {
     }
     printf '%s\n' "$cleanup_current_image" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 0
     [ "$PREVIOUS_IMAGE_ID" != "$cleanup_current_image" ] || return 0
+    cleanup_unused_image "$PREVIOUS_IMAGE_ID"
+}
 
-    cleanup_refs="$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' "$PREVIOUS_IMAGE_ID" 2>/dev/null)" || {
+cleanup_unused_image() {
+    cleanup_id="$1"
+    printf '%s\n' "$cleanup_id" | grep -Eq '^sha256:[0-9a-f]{64}$' || return 0
+    cleanup_refs="$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' "$cleanup_id" 2>/dev/null)" || {
         echo "WARNING: Could not inspect the old image; cleanup was skipped." >&2
         return 0
     }
     # Preserve images also named by the user or another repository.
-    if printf '%s\n' "$cleanup_refs" | grep -Ev '^(|(docker\.io/)?xream/sub-store(:latest|@sha256:[0-9a-f]{64}))$' >/dev/null; then
+    allowed_refs='^(|(docker\.io/)?xream/sub-store(:latest|@sha256:[0-9a-f]{64}))$'
+    if [ "${2:-}" = delete ]; then
+        [ -n "$cleanup_refs" ] || return 0
+        allowed_refs='^(|(docker\.io/)?xream/sub-store(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[0-9a-f]{64}))$'
+    fi
+    if printf '%s\n' "$cleanup_refs" | grep -Ev "$allowed_refs" >/dev/null; then
         echo "Old image has other repository references; keeping it."
         return 0
     fi
-    cleanup_users="$(docker ps -aq --filter "ancestor=$PREVIOUS_IMAGE_ID" 2>/dev/null)" || {
+    cleanup_users="$(docker ps -aq --filter "ancestor=$cleanup_id" 2>/dev/null)" || {
         echo "WARNING: Could not check old image usage; cleanup was skipped." >&2
         return 0
     }
@@ -588,8 +636,10 @@ cleanup_replaced_image() {
         return 0
     fi
     # No force, global prune, volume removal, or filesystem deletion.
-    if docker image rm "$PREVIOUS_IMAGE_ID"; then
+    if docker image rm "$cleanup_id"; then
         echo "旧镜像已清理，用户数据保留。"
+    elif [ "${2:-}" = delete ]; then
+        echo "WARNING: The unused image could not be removed; keeping it." >&2
     else
         echo "WARNING: Update succeeded, but the old image could not be removed; keeping it." >&2
     fi
@@ -623,7 +673,10 @@ replace_container() {
     daemon_ready
     ensure_data_volume
     RUN_IMAGE_REF="$IMAGE_REF"
-    if [ "${1:-}" = "update" ]; then
+    if [ "${CONFIGURED_IMAGE:-xream/sub-store:latest}" != xream/sub-store:latest ]; then
+        RUN_IMAGE_REF="$CONFIGURED_IMAGE"
+    fi
+    if [ "${1:-}" = "update" ] || [ "${1:-}" = apply ]; then
         RUN_IMAGE_REF="${2:-xream/sub-store:latest}"
         assert_official_image_ref "$RUN_IMAGE_REF"
     fi
@@ -737,7 +790,7 @@ replace_container() {
     check_port_conflicts
     check_storage_capacity
 
-    if [ "${1:-}" = "update" ] || ! docker image inspect "$RUN_IMAGE_REF" >/dev/null 2>&1; then
+    if [ "${1:-}" = "update" ] || { [ "${1:-}" != apply ] && ! docker image inspect "$RUN_IMAGE_REF" >/dev/null 2>&1; }; then
         pull_ref="$RUN_IMAGE_REF"
         if ! docker pull "$pull_ref"; then
             [ "$HAD_OLD_CONTAINER" = "1" ] && restore_previous_settings
@@ -754,6 +807,11 @@ replace_container() {
             echo "Current container already uses the latest image; no rebuild is required."
             return 0
         fi
+    fi
+
+    if [ "${1:-}" = apply ]; then
+        applied_image_id="$(docker image inspect -f '{{.Id}}' "$RUN_IMAGE_REF")" || return 1
+        [ "$applied_image_id" = "$3" ] || fail "local image changed during apply"
     fi
 
     if [ "$HAD_OLD_CONTAINER" = "1" ]; then
@@ -818,6 +876,10 @@ replace_container() {
                 rollback_replacement
                 fail "could not save the new container installer recovery identity"
             }
+        fi
+        if [ "${KEEP_STOPPED:-0}" = 1 ] && ! docker stop sub-store >/dev/null; then
+            rollback_replacement
+            fail "could not restore the stopped service state"
         fi
         if ! persist_running_image_ref; then
             rollback_replacement
@@ -1004,11 +1066,11 @@ case "$ACTION" in
     install-deploy)
         install_deploy "${2:-restart}" "${3:-}"
         ;;
-    update-all)
+    update-all|upgrade-apply)
         image_result=0
         plugin_result=0
         echo '检查并更新 Sub-Store Docker 镜像...'
-        if ( "$0" update ); then
+        if ( if [ "$ACTION" = upgrade-apply ]; then update_image apply; else "$0" update; fi ); then
             echo 'Docker 镜像检查完成。'
         else
             image_result=$?
@@ -1054,6 +1116,45 @@ case "$ACTION" in
             echo "sub-store container does not exist."
         fi
         ;;
+    install)
+        daemon_ready
+        if docker inspect sub-store >/dev/null 2>&1; then
+            fail "container already exists"
+        fi
+        IMAGE_REF="$CONFIGURED_IMAGE"
+        valid_config
+        legacy_data_dir="$(uci -q get sub-store.main.data_dir 2>/dev/null || true)"
+        if [ -n "$legacy_data_dir" ]; then
+            import_legacy_directory "$legacy_data_dir"
+            uci -q delete sub-store.main.data_dir
+            uci commit sub-store
+            chmod 600 "$CONFIG"
+        fi
+        replace_container
+        (umask 077; touch /etc/sub-store/installed)
+        /etc/init.d/sub-store enable
+        ;;
+    service-start|service-restart)
+        assert_sub_store_container sub-store
+        service_state="$(docker inspect -f '{{.State.Status}}' sub-store)" || exit 1
+        case "$ACTION:$service_state" in
+            service-start:exited|service-start:created|service-restart:running) ;;
+            *) fail "service action is unavailable in state $service_state" ;;
+        esac
+        docker "${ACTION#service-}" sub-store
+        ;;
+    delete-container)
+        delete_id="$(docker inspect -f '{{.Id}}' sub-store)" || exit 1
+        assert_sub_store_container "$delete_id"
+        delete_state="$(docker inspect -f '{{.State.Status}}' "$delete_id")" || exit 1
+        case "$delete_state" in exited|created) ;; *) fail "stop the container before deleting it" ;; esac
+        delete_mount="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/opt/app/data"}}{{.Type}}{{end}}{{end}}' "$delete_id")" || exit 1
+        case "$delete_mount" in bind|volume) ;; *) fail "cannot verify persistent storage; container was kept" ;; esac
+        delete_image="$(docker inspect -f '{{.Image}}' "$delete_id")" || exit 1
+        docker rm "$delete_id" || exit 1
+        /etc/init.d/sub-store disable || exit 1
+        cleanup_unused_image "$delete_image" delete
+        ;;
     export-data)
         export_data "${2:-}"
         ;;
@@ -1061,6 +1162,6 @@ case "$ACTION" in
         uninstall_plugin "${2:-}"
         ;;
     *)
-        fail "usage: sub-storectl {status|health|app-version|url|api-url|storage|logs|check-plugin-update|install-plugin-update|render|import-legacy|start|stop|restart|pull|update|install-deploy|update-all|rotate-key|remove-container|export-data|uninstall}"
+        fail "usage: sub-storectl {status|health|app-version|url|api-url|storage|logs|check-plugin-update|install-plugin-update|render|import-legacy|start|stop|restart|install|service-start|service-restart|delete-container|pull|update|install-deploy|update-all|upgrade-apply|rotate-key|remove-container|export-data|uninstall}"
         ;;
 esac

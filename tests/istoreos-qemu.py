@@ -325,7 +325,10 @@ def main() -> None:
             before = ssh_command(
                 ssh_port,
                 key_path,
-                "set -e; test \"$(/usr/bin/sub-storectl status)\" = running; "
+                "set -e; test \"$(/usr/bin/sub-storectl status)\" = not-created; "
+                "if docker image inspect xream/sub-store:latest >/dev/null 2>&1; then exit 1; fi; "
+                "/usr/bin/sub-storectl install; "
+                "test \"$(/usr/bin/sub-storectl status)\" = running; "
                 "test \"$(cat /etc/sub-store/version)\" = " + INITIAL_VERSION + "; "
                 "docker exec -i sub-store node --input-type=commonjs - < /usr/lib/sub-store/healthcheck.js >/dev/null; "
                 "container=$(docker inspect -f '{{.Id}}' sub-store); "
@@ -333,6 +336,7 @@ def main() -> None:
                 "printf 'ci-data-marker\\n' > \"$volume/ci-marker\"; "
                 "config=$(sha256sum /etc/config/sub-store | cut -d' ' -f1); "
                 "printf '%s %s %s\\n' \"$container\" \"$config\" \"$volume\"",
+                timeout=INSTALL_TIMEOUT_SECONDS,
             ).split()
             if len(before) != 3:
                 raise RuntimeError(f"Could not capture installed container state: {before}")
