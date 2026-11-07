@@ -9,7 +9,7 @@ function setup() {
     const state = { container: 'running', health: 'healthy', url: 'http://router.test:3001/?api=x', busy: false, version: 'test',
         app_version: '2.42.3', created: '2026-10-13T00:00:00Z', output: 'maintenance log', container_log: 'runtime log',
         storage: '/mnt/docker/volumes/sub-store-data/_data', plugin_latest_version: '', plugin_update_available: false };
-    const E = (tag, attrs = {}, children = []) => ({ tag, ...attrs, children, textContent: '', value: '', focus() {}, select() {},
+    const E = (tag, attrs = {}, children = []) => ({ tag, style: {}, ...attrs, children, textContent: '', value: '', focus() {}, select() {},
         setAttribute(name, value) { this[name] = value; } });
     const ui = { createHandlerFn: (ctx, fn) => function(...args) {
         if (global.window && global.window.requireCurrentTarget && !args.some(arg => arg && arg.currentTarget))
@@ -90,8 +90,9 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.deepEqual(t.view.map.sections[0].options.map(option => option.name), [
         '_service_status'
     ]);
-    assert.equal(t.view.map.sections[0].args[3], '服务概览');
+    assert.equal(t.view.map.sections[0].args[3], '服务状态');
     assert.deepEqual(t.view.map.sections[1].tabs.map(tab => tab.name), ['basic', 'logs', 'maintenance']);
+    assert.equal(t.view.map.sections[1].tabs[2].label, '维护');
     assert.deepEqual(t.view.map.sections[1].options.filter(option => option.tab === 'basic').map(option => option.name), [
         'frontend_port', 'access_host', 'public_url',
         'backend_port', 'backend_lan_access', '_api',
@@ -116,17 +117,16 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.equal(t.view.open['aria-label'], '打开Sub-Store管理界面');
     assert.equal(t.view.open.class, 'btn small cbi-button cbi-button-positive');
     const statusControl = t.options._service_status.renderWidget();
-    assert.equal(statusControl.children[0].children[0], 'sub-store 的状态信息如下：');
-    assert.equal(statusControl.children[1].children[0].children[0].children[0], t.view.statusLabel);
-    assert.equal(statusControl.children[1].children[0].children[1].children[0], t.view.status);
+    assert.equal(t.options._service_status.label, '状态');
+    assert.deepEqual(statusControl.children, [t.view.status, '　', t.view.open]);
+    assert.equal(t.view.status.tag, 'strong');
     assert.equal(t.options._management_address, undefined);
     assert.equal(t.view.address, undefined);
     assert.equal(t.view.copyAddressButton, undefined);
-    assert.equal(t.view.status.textContent, 'SUB-STORE 运行中');
+    assert.equal(t.view.status.textContent, '运行中');
+    assert.equal(t.view.status.role, 'status');
     assert.equal(t.view.version.textContent, 'test');
     assert.equal(t.view.updateStatus.textContent, '');
-    assert.equal(t.view.status.className, 'btn small cbi-button cbi-button-positive');
-    assert.equal(t.view.statusLabel.textContent, '状态');
     assert.equal(t.view.startButton.disabled, true);
     assert.equal(t.view.stopButton.disabled, false);
     assert.equal(t.view.restartButton.disabled, false);
@@ -137,8 +137,9 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.equal(t.view.image.textContent, 'xream/sub-store:latest');
     assert.equal(t.options._storage, undefined);
     assert.equal(t.view.storage, undefined);
-    for (const id of ['_plugin_version', '_image', '_app_version', '_updates', '_rotate'])
+    for (const id of ['_plugin_version', '_image', '_app_version', '_rotate'])
         assert.equal(t.options[id].tab, 'maintenance');
+    assert.equal(t.options._updates, undefined);
     assert.equal(t.options._maintenance, undefined);
     assert.equal(t.view.maintenancePanel, undefined);
     assert.doesNotMatch(source, /完整地址含 API 参数/);
@@ -158,7 +159,7 @@ test('native page groups settings, masks key and schedules status polling', asyn
     assert.equal(t.view.clearLogButtons.operation.children[0], '清空日志');
     assert.deepEqual(t.view.logTabMenu.children.map(item => item.children[0].children[0]), ['运行日志', '维护日志']);
     assert.equal(t.view.logTabMenu.class, 'cbi-tabmenu');
-    assert.ok(t.view.logTabMenu.children.every(item => item.style === undefined && item.children[0].style === undefined));
+    assert.ok(t.view.logTabMenu.children.every(item => Object.keys(item.style).length === 0 && Object.keys(item.children[0].style).length === 0));
     assert.equal(t.calls.some(call => call[0] === 'tabs' && call[1] === t.view.logPanes), true);
     assert.equal(t.options._logs.renderWidget().children[0], t.view.logPanes[0]);
     assert.equal(t.view.logPanes[0].children[0], t.view.clearLogButtons.container);
@@ -205,8 +206,7 @@ test('unhealthy container is visible and completed work refreshes details', asyn
     const t = setup(); await t.view.render(await t.view.load());
     t.state.health = 'unhealthy';
     await t.view.refresh('summary');
-    assert.equal(t.view.status.textContent, 'SUB-STORE 运行异常');
-    assert.equal(t.view.status.className, 'btn small cbi-button cbi-button-negative');
+    assert.equal(t.view.status.textContent, '运行异常');
     t.state.busy = true;
     await t.view.refresh('summary');
     t.calls.length = 0;
@@ -361,7 +361,7 @@ test('XHR timeout is quiet when polling confirms the queued task', async () => {
     };
     await t.view.run('update');
     await t.view.enqueueTask;
-    assert.equal(t.view.status.textContent, 'SUB-STORE 正在维护');
+    assert.equal(t.view.status.textContent, '正在维护');
     assert.equal(t.calls.some(call => call[0] === 'notice'), false);
     assert.equal(t.view.localBusy, false);
 });

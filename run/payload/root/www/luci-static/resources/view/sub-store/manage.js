@@ -61,6 +61,7 @@ return view.extend({
         if (this.serviceButtons) {
             for (const [action, button] of Object.entries(this.serviceButtons)) {
                 button.hidden = !visible.includes(action);
+                button.style.display = button.hidden ? 'none' : '';
                 button.disabled = disabled || button.hidden;
             }
         }
@@ -151,18 +152,15 @@ return view.extend({
         const s = this.state;
         const unhealthy = s.container === 'running' && s.health === 'unhealthy';
         const starting = s.container === 'running' && s.health === 'starting';
-        const statusText = unhealthy ? 'SUB-STORE 运行异常' : starting ? 'SUB-STORE 启动中' :
-            s.container === 'running' ? 'SUB-STORE 运行中' :
+        const statusText = unhealthy ? '运行异常' : starting ? '启动中' :
+            s.container === 'running' ? '运行中' :
                 s.container === 'docker-unavailable' ? 'Docker 不可用' :
-                    s.container === 'not-created' ? 'SUB-STORE 尚未安装' :
-                        'SUB-STORE ' + (names[s.container] || s.container || '状态未知');
+                    (names[s.container] || s.container || '状态未知');
         this.status.textContent = statusText;
-        this.status.className = 'btn small cbi-button ' +
-            (s.container === 'running' && !unhealthy ? 'cbi-button-positive' : 'cbi-button-negative');
-        this.statusLabel.textContent = '状态';
         this.version.textContent = s.version || '未知';
         this.open.href = s.url || '#';
         this.open.hidden = !s.url || s.container !== 'running';
+        this.open.style.display = this.open.hidden ? 'none' : '';
         const image = String(s.image || '').split(/\s+\/\s+/, 1);
         this.image.textContent = image[0] || '容器镜像未就绪';
         this.appVersion.textContent = s.app_version || '容器日志未提供版本号';
@@ -368,8 +366,7 @@ return view.extend({
     render: async function(data) {
         this.state = data[1];
         this.buttons = [];
-        this.status = E('span');
-        this.statusLabel = E('span');
+        this.status = E('strong', { 'role': 'status', 'aria-live': 'polite' });
         this.version = E('span');
         this.open = E('a', { 'class': 'btn small cbi-button cbi-button-positive', target: '_blank', rel: 'noopener noreferrer' }, ['打开']);
         this.open.textContent = '打开Sub-Store';
@@ -387,11 +384,11 @@ return view.extend({
             'delete-container': this.button('删除', 'delete-container', 'negative')
         };
         const m = this.map = new form.Map('sub-store', 'sub-store');
-        const overview = m.section(form.NamedSection, 'main', 'settings', '服务概览');
+        const overview = m.section(form.NamedSection, 'main', 'settings', '服务状态');
         const s = m.section(form.NamedSection, 'main', 'settings');
         s.tab('basic', '基本设置');
         s.tab('logs', '日志');
-        s.tab('maintenance', '更新维护');
+        s.tab('maintenance', '维护');
         const displayOverview = (id, label, node) => {
             const option = overview.option(form.DummyValue, id, label);
             option.renderWidget = function() { return node; };
@@ -402,15 +399,7 @@ return view.extend({
             option.renderWidget = function() { return node; };
             return option;
         };
-        displayOverview('_service_status', '服务状态', E('div', {}, [
-            E('p', {}, ['sub-store 的状态信息如下：']),
-            E('div', { 'class': 'table' }, [
-                E('div', { 'class': 'tr' }, [
-                    E('div', { 'class': 'td' }, [this.statusLabel]),
-                    E('div', { 'class': 'td' }, [this.status, ' ', this.open])
-                ])
-            ])
-        ]));
+        displayOverview('_service_status', '状态', E('div', {}, [this.status, '　', this.open]));
         let o = s.taboption('basic', form.Value, 'frontend_port', '管理页面端口');
         o.datatype = 'port'; o.rmempty = false; o.default = '3001';
         const frontend = o;
@@ -490,12 +479,9 @@ return view.extend({
             }) }, ['重新生成']);
         this.buttons.push(rotate);
         this.rotateButton = rotate;
-        display('maintenance', '_plugin_version', '插件版本', this.version);
+        display('maintenance', '_plugin_version', '插件版本', E('div', {}, [this.version, '　', this.updateStatus]));
         display('maintenance', '_app_version', 'Sub-Store 版本', this.appVersion);
         display('maintenance', '_image', 'Docker 镜像', this.image);
-        display('maintenance', '_updates', '更新', E('div', {}, [
-            this.updateStatus
-        ]));
         display('maintenance', '_rotate', 'API 密钥', rotate);
         const formNode = await m.render();
         ui.tabs.initTabGroup(this.logPanes);
