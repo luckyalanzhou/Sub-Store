@@ -243,7 +243,16 @@ test_apt_installer_writes_only_official_repo_metadata() (
     download_urls_file="$TMP/apt-downloads"
     : > "$apt_calls_file"
     : > "$download_urls_file"
-    apt-get() { printf '%s\n' "$*" >> "$apt_calls_file"; }
+    apt_stub_directory="$TMP/apt/bin"
+    mkdir -p "$apt_stub_directory"
+    APT_CALLS_FILE="$apt_calls_file"
+    export APT_CALLS_FILE
+    cat > "$apt_stub_directory/apt-get" <<'APT_GET_STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$APT_CALLS_FILE"
+APT_GET_STUB
+    chmod +x "$apt_stub_directory/apt-get"
+    PATH="$apt_stub_directory:$PATH"
     dpkg() { printf 'amd64\n'; }
     vps_download_file() { printf '%s\n' "$1" >> "$download_urls_file"; printf 'fake docker signing key\n' > "$2"; }
     vps_detect_platform
