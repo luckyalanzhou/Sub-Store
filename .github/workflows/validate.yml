@@ -46,6 +46,8 @@ jobs:
             run/payload/root/usr/lib/sub-store/job.sh \
             run/payload/root/usr/lib/sub-store/plugin-update \
             run/payload/root/usr/lib/sub-store/permissions.sh \
+            scripts/sub-store-vps.sh \
+            tests/vps-deploy.sh \
             tests/install-permissions.sh \
             tests/install-operation-lock.sh \
             tests/install-recovery.sh \
@@ -75,6 +77,8 @@ jobs:
           exec busybox awk "$@"
           EOF
           chmod +x "$awk_bin/awk"
+          echo 'Running BusyBox regression: vps-deploy'
+          PATH="$awk_bin:$PATH" busybox ash tests/vps-deploy.sh
           echo 'Running BusyBox regression: cron-validation'
           PATH="$awk_bin:$PATH" busybox ash tests/cron-validation.sh
           echo 'Running BusyBox regression: docker-volume-storage'

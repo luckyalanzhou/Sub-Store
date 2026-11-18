@@ -2,14 +2,14 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 产品 | Sub-Store for iStoreOS LuCI 插件 |
+| 产品 | Sub-Store for iStoreOS LuCI 插件与独立 VPS 管理命令 |
 | 状态 | 根据当前仓库实现整理；实现行为以代码为准 |
 | 目标平台 | iStoreOS 24.10（opkg）、iStoreOS 25.12（apk） |
 | 上游应用 | 官方 Docker 镜像 `xream/sub-store` |
 
 ## 1. 产品概述
 
-本项目为 iStoreOS/OpenWrt 提供 LuCI 管理界面和设备侧脚本，用于安装、配置、运行、更新和卸载 Sub-Store。它管理官方 Sub-Store Docker 镜像及其运行环境，不修改或重新打包上游应用。
+本项目为 iStoreOS/OpenWrt 提供 LuCI 管理界面和设备侧脚本，并为常见 Linux VPS 提供独立的 Shell 安装器与管理命令，用于安装、配置、运行、更新和卸载 Sub-Store。两条部署入口互相独立；都管理官方 Sub-Store Docker 镜像及其运行环境，不修改或重新打包上游应用。
 
 ## 2. 产品目标
 
@@ -18,6 +18,7 @@
 3. 插件与应用镜像能够独立检测和更新，避免无变化时无谓拉取镜像或重建容器。
 4. 安装、升级、回滚和卸载以保留用户数据为默认行为；数据删除必须由用户明确触发。
 5. 安装器能适配目标系统的包管理器和 BusyBox `ash` 环境，并对失败操作给出可诊断结果。
+6. VPS 用户可以通过一条 `curl` 或 `wget` 命令安装独立管理器；Docker Engine 缺失时使用 Docker 官方软件源安装，再部署官方 Sub-Store 容器。
 
 ## 3. 用户与场景
 
@@ -25,6 +26,7 @@
 
 - 在 iStoreOS/OpenWrt 路由器上运行 Sub-Store 的家庭或个人用户。
 - 需要通过 LuCI 管理服务、更新和检查运行状态的设备管理员。
+- 在受支持的 Linux VPS 上运行 Sub-Store、没有 LuCI 管理页面的服务器管理员。
 
 ### 主要场景
 
@@ -34,6 +36,7 @@
 - 检查并分别更新镜像和 LuCI 插件。
 - 迁移旧数据目录到 Docker 数据卷、导出数据、卸载插件，或在明确选择时删除数据。
 - 安装或更新失败时恢复此前插件文件或容器部署。
+- 在 VPS 首次部署时设置端口、DDNS/公网地址、API 路径和同步 Cron，并通过 CLI 管理服务。
 
 ## 4. 范围
 
@@ -43,6 +46,7 @@
 - `.run` 安装、依赖安装、包管理器检测、升级事务和失败恢复。
 - Docker 容器配置、服务生命周期、健康状态、镜像更新与数据卷管理。
 - 插件更新、运行/维护日志、数据导出、旧目录迁移和安全卸载。
+- VPS 独立安装器及 `sub-store-vps` CLI；使用 `/etc/sub-store-vps.conf` 保存 root-only 配置，并使用本机 Docker 默认 Unix socket 管理容器。
 
 ### 不在范围内
 
@@ -50,6 +54,8 @@
 - 提供自有订阅处理后端或第三方镜像源。
 - 保证用户网络中的 DNS、反向代理、证书、防火墙和远程访问策略可用。
 - 在 LuCI 管理页中提供数据导出界面；当前数据导出通过设备端 `sub-storectl export-data` 命令执行。
+- 把 VPS 安装、配置或服务控制集成进 iStoreOS 的 `.run`、LuCI、UCI 或 rpcd 流程。
+- 在 VPS 上自动配置系统防火墙、云防火墙、TLS 证书或反向代理。
 
 ## 5. 核心功能需求
 
@@ -114,6 +120,18 @@ LuCI 提供以下配置：
 - 操作前检查容器身份；不匹配时安全停止，不移除或替换未受信任容器。
 - 数据卷与容器生命周期分离，容器替换或更新不得重置用户数据。
 
+### FR-8 VPS 独立部署与命令行管理
+
+- 提供跨发行版 POSIX Shell 脚本和 `sub-store-vps` 管理命令；脚本要求 root，只操作本机 Docker 默认 Unix socket。
+- 仅接受 Docker 官方文档列出的 Ubuntu、Debian、Fedora、CentOS Stream、RHEL、AlmaLinux、Rocky Linux 和 Oracle Linux 受支持版本。未知系统、无效版本、远程 Docker context、`DOCKER_HOST` 或 Podman 兼容 CLI 在危险变更前必须拒绝。
+- Docker Engine 缺失时按发行版使用 Docker 官方 APT/RPM 软件源安装并启动；不得运行 convenience script、删除旧运行时或自动替换 Podman。
+- 首次安装支持交互默认值和非交互参数。前端默认 `3001` 且发布到所有接口，后端默认 `3000` 且绑定 `127.0.0.1`；DDNS 用户输入优先，没有时使用默认路由 IPv4，不向第三方查询公网 IP。
+- API 路径默认随机生成 48 位十六进制值；安装摘要和 `api-path` 命令可以显式显示。配置文件权限为 `0600`，`config show` 隐藏路径。
+- `config set` 验证并应用配置；配置/镜像替换需在健康检查失败时恢复旧容器和设置。原先停止的容器应用后仍保持停止。
+- `status`、`url`、`start`、`stop`、`restart`、`update`、`logs` 和 `remove` 提供无 LuCI 场景的管理能力。更新与默认移除保留 `sub-store-data`；只有明确指定 `--delete-data` 才删除数据卷。
+- 普通删除需要确认，非交互模式须使用 `--yes`；只允许清理官方且未被其他容器/镜像引用的镜像。
+- VPS 入口不调用 iStoreOS `.run`、UCI、rpcd 或设备端 `sub-storectl`，不改变路由器现有流程。
+
 ## 6. 技术架构
 
 ```text
@@ -128,6 +146,9 @@ LuCI 提供以下配置：
                                └─ 插件更新与健康诊断
 
 makeself .run → install.sh → opkg/apk → LuCI 插件、服务脚本和 Docker 部署
+
+VPS install script → Docker 官方 APT/RPM → 本机 Docker Engine → xream/sub-store
+                              └→ /etc/sub-store-vps.conf (0600)
 ```
 
 ### 技术组件
@@ -137,6 +158,7 @@ makeself .run → install.sh → opkg/apk → LuCI 插件、服务脚本和 Dock
 - 设备端：POSIX Shell，兼容 BusyBox `ash`；UCI、Docker CLI、cron。
 - 健康检查和版本识别：Node.js 脚本，在官方容器中检查前端资源、API 和应用版本。
 - 发布：`scripts/build-run.sh` 使用 makeself 生成 `.run`；GitHub Actions 分离源码验证、固件集成和正式发布。
+- VPS：`scripts/sub-store-vps.sh` 通过独立 CLI 管理 root-only 配置、Docker Engine、容器和命名卷；不读取 LuCI/UCI 状态。
 
 ## 7. 质量属性与约束
 
@@ -147,6 +169,7 @@ makeself .run → install.sh → opkg/apk → LuCI 插件、服务脚本和 Dock
 - **界面一致性：** 使用 LuCI 原生控件；保存、应用和服务控制语义清楚。
 - **可诊断性：** 后台操作有可轮询状态、阶段、结果和有界日志。
 - **发布边界：** 源码 CI 不构建发布包；正式 `.run` 通过手动发布工作流构建，遵循版本递增和失败恢复流程。
+- **VPS 网络安全：** 脚本不改防火墙；文档说明 Docker 端口发布可能绕过常规 UFW/firewalld 规则，并建议用云防火墙和 HTTPS 反向代理限制公网访问。
 
 ## 8. 验收标准
 
@@ -163,6 +186,13 @@ makeself .run → install.sh → opkg/apk → LuCI 插件、服务脚本和 Dock
 | AC-9 | 安装锁、状态目录、日志、备份或导出路径若权限/所有者/符号链接不符合要求，相关操作安全失败且不覆盖不可信目标。 | `tests/install-operation-lock.sh`、`tests/install-log.sh`、`tests/install-permissions.sh`、`tests/export-data.sh` |
 | AC-10 | 所有目标 Shell 文件通过 POSIX `sh -n` 和 BusyBox `ash -n`；Lua、Node.js 和 Python 检查按源码 CI 执行。 | `.github/workflows/validate.yml` |
 | AC-11 | 在 iStoreOS 24.10 和 25.12 固件环境完成安装/更新集成验证后，才能宣称固件级验收通过。 | 手动 `.github/workflows/istoreos-integration.yml`；源码 CI 不替代此项 |
+| AC-12 | VPS 脚本只接受受支持发行版/版本并选择对应 Docker 官方仓库；其他系统在写入软件源或安装软件前失败。 | `tests/vps-deploy.sh`、Docker 官方安装文档 |
+| AC-13 | Docker 缺失时按 APT/RPM 分支安装并启动；已有 Docker Engine 不重复安装；远程 context、`DOCKER_HOST` 和 Podman 兼容 CLI 不会成为部署目标。 | `tests/vps-deploy.sh`、Ubuntu/Debian/Fedora/RHEL Docker 官方安装文档 |
+| AC-14 | 安装默认值和参数可用；DDNS/默认路由选择不调用第三方 IP 查询；API 路径为 48 位十六进制、普通配置输出脱敏、安装摘要可读。 | `tests/vps-deploy.sh` |
+| AC-15 | VPS 配置应用和镜像更新维持卷与容器原运行状态；健康检查失败后恢复旧配置和容器；同一镜像 ID 不重建。 | `tests/vps-deploy.sh` |
+| AC-16 | VPS 默认删除保留数据卷；只有显式 `--delete-data` 删除且删除前确认；非交互移除必须给出 `--yes`，共用或非官方镜像不被清理。 | `tests/vps-deploy.sh` |
+| AC-17 | VPS 文档提供 curl/wget 下载命令、配置参数、命令参考、端口边界、API 路径隐私和防火墙/TLS 注意事项；其入口不修改 iStoreOS `.run`、LuCI 或 UCI 流程。 | README、使用笔记、源码差异检查 |
+| AC-18 | VPS 脚本和回归在 POSIX `sh` 与 BusyBox `ash` 语法下通过，并与现有 iStoreOS shell 回归一起运行。 | `.github/workflows/validate.yml` |
 
 ## 9. 发布与验收边界
 
