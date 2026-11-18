@@ -161,6 +161,25 @@ prepare_plugin_rollback() {
     PLUGIN_UPDATE_ACTIVE=1
 }
 
+prepare_install_transaction_parent() {
+    [ ! -L /etc/sub-store ] || fail "Installer recovery parent directory is unsafe."
+    if [ ! -e /etc/sub-store ]; then
+        (umask 022; mkdir /etc/sub-store) || fail "Could not create installer recovery parent directory."
+    fi
+    [ -d /etc/sub-store ] && [ ! -L /etc/sub-store ] ||
+        fail "Installer recovery parent directory is unsafe."
+    parent_owner="$(LC_ALL=C ls -ldn /etc/sub-store 2>/dev/null | awk '
+        NR != 1 { exit 1 }
+        {
+            mode = substr($1, 1, 10)
+            if (substr(mode, 1, 1) != "d" || substr(mode, 2, 3) != "rwx" ||
+                substr(mode, 6, 1) == "w" || substr(mode, 9, 1) == "w") exit 1
+            print $3
+            exit
+        }')" || fail "Could not verify installer recovery parent directory."
+    [ "$parent_owner" = "0" ] || fail "Installer recovery parent directory is not owned by root."
+}
+
 install_recovery_hook() {
     mkdir -p /usr/lib/sub-store /etc/rc.d
     cp "$PACKAGE_DIR/root/usr/lib/sub-store/install-recovery" /usr/lib/sub-store/install-recovery ||
@@ -376,6 +395,7 @@ fi
 step 4 "安装管理界面并准备配置"
 [ -e /etc/rc.d/S99sub-store ] && SERVICE_WAS_ENABLED=1
 FULL_INSTALL_ACTIVE=1
+prepare_install_transaction_parent
 prepare_plugin_rollback
 install_recovery_hook
 (umask 022; cp -R "$PACKAGE_DIR/root/." /)
